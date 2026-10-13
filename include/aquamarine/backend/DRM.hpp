@@ -561,7 +561,9 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
 
         Hyprutils::Memory::CSharedPointer<CMSCTransfer>               msc;
-        bool                                                          mscTried = false;
+        uint32_t                                                      mscAttempts      = 0;
+        uint64_t                                                      mscCopiesAtBuild = 0;
+        bool                                                          mscGaveUp        = false;
         Hyprutils::Memory::CSharedPointer<CMSCAllocator>              mscAlloc;
 
         bool                                                          atomic = false;

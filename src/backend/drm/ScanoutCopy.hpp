@@ -66,6 +66,7 @@ namespace Aquamarine {
         ~CMSCTransfer();
 
         bool                                       good();
+        uint64_t                                   copyCount() const;
 
         Hyprutils::Memory::CSharedPointer<IBuffer> allocateDestination(uint32_t fourcc, const Hyprutils::Math::Vector2D& size);
 
@@ -90,6 +91,10 @@ namespace Aquamarine {
         // one costs a vkCreateImage plus a dedicated allocation of its dma-buf.
         int  acquireSource(const Hyprutils::Memory::CSharedPointer<IBuffer>& src, const SDMABUFAttrs& attrs, VkFormat format);
         void evictIdleSources();
+
+        // Logs a failed Vulkan call and latches a lost device, which is the only failure the
+        // backend can recover from by rebuilding the engine.
+        bool checkResult(VkResult result, const char* what);
 
         void log(eBackendLogLevel level, const std::string& msg);
 

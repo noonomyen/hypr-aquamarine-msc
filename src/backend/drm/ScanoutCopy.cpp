@@ -362,6 +362,10 @@ CMSCTransfer::~CMSCTransfer() {
     if (!m_impl)
         return;
     if (m_impl->device) {
+        // The rebuild path can drop this transfer while a copy is still in flight, so make sure
+        // the device is idle before its objects go (a lost device returns at once).
+        vkDeviceWaitIdle(m_impl->device);
+
         for (const auto& SLOT : m_impl->slots) {
             if (SLOT.outgoing)
                 vkDestroySemaphore(m_impl->device, SLOT.outgoing, nullptr);
@@ -525,14 +529,16 @@ int CMSCTransfer::acquireSource(const SP<IBuffer>& src, const SDMABUFAttrs& attr
                                  .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
                                  .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VkImage           image   = VK_NULL_HANDLE;
-    if (vkCreateImage(m_impl->device, &imgInfo, nullptr, &image) != VK_SUCCESS)
+    if (!checkResult(vkCreateImage(m_impl->device, &imgInfo, nullptr, &image), "importing a source image"))
         return -1;
 
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(m_impl->device, image, &req);
     VkMemoryFdPropertiesKHR fdProps = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-    if (!m_impl->getMemoryFdProps || m_impl->getMemoryFdProps(m_impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, attrs.fds[0], &fdProps) != VK_SUCCESS) {
-        vkDestroyImage(m_impl->device, image, nullptr);
+    if (!m_impl->getMemoryFdProps ||
+        !checkResult(m_impl->getMemoryFdProps(m_impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, attrs.fds[0], &fdProps), "querying the source dma-buf")) {
+        if (image)
+            vkDestroyImage(m_impl->device, image, nullptr);
         return -1;
     }
 
@@ -547,15 +553,22 @@ int CMSCTransfer::acquireSource(const SP<IBuffer>& src, const SDMABUFAttrs& attr
         if (IMPORTFD < 0)
             continue;
         VkImportMemoryFdInfoKHR       import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = IMPORTFD};
-        VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &import, .image = image};
-        VkMemoryAllocateInfo          alloc     = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = i};
-        if (vkAllocateMemory(m_impl->device, &alloc, nullptr, &srcMem) != VK_SUCCESS) {
+        VkMemoryDedicatedAllocateInfo dedicated  = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &import, .image = image};
+        VkMemoryAllocateInfo          alloc      = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = i};
+        const VkResult                ALLOCSTATE = vkAllocateMemory(m_impl->device, &alloc, nullptr, &srcMem);
+        if (ALLOCSTATE != VK_SUCCESS) {
             close(IMPORTFD);
             srcMem = VK_NULL_HANDLE;
+            if (ALLOCSTATE == VK_ERROR_DEVICE_LOST) {
+                // trying another memory type is normal, a lost device is not
+                checkResult(ALLOCSTATE, "importing the source dma-buf");
+                vkDestroyImage(m_impl->device, image, nullptr);
+                return -1;
+            }
             continue;
         }
     }
-    if (!srcMem || vkBindImageMemory(m_impl->device, image, srcMem, 0) != VK_SUCCESS) {
+    if (!srcMem || !checkResult(vkBindImageMemory(m_impl->device, image, srcMem, 0), "binding the source image")) {
         if (srcMem)
             vkFreeMemory(m_impl->device, srcMem, nullptr);
         vkDestroyImage(m_impl->device, image, nullptr);
@@ -586,6 +599,24 @@ void CMSCTransfer::evictIdleSources() {
     });
 }
 
+// A lost device cannot be used again, and the backend rebuilds the whole engine from this flag.
+// Every other failure is per-frame: log it, let the next frame try again.
+bool CMSCTransfer::checkResult(VkResult result, const char* what) {
+    if (result == VK_SUCCESS)
+        return true;
+
+    log(AQ_LOG_ERROR, std::format("drm: MSC: {} failed (VkResult {})", what, (int)result));
+    if (result == VK_ERROR_DEVICE_LOST) {
+        m_bad = true;
+        log(AQ_LOG_ERROR, "drm: MSC: the compose device was lost, the copy engine will be rebuilt");
+    }
+    return false;
+}
+
+uint64_t CMSCTransfer::copyCount() const {
+    return m_impl ? m_impl->copies : 0;
+}
+
 bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence) {
     if (!good() || !src || !dst)
         return false;
@@ -611,9 +642,15 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     m_impl->nextSlot = (m_impl->nextSlot + 1) % 3;
     if (vkGetFenceStatus(m_impl->device, SLOT.fence) != VK_SUCCESS) {
         ++m_impl->slotWaits;
-        if (vkWaitForFences(m_impl->device, 1, &SLOT.fence, VK_TRUE, 1000000000) != VK_SUCCESS) {
+        // A slot that does not come back is either a lost device or a wedged copy engine: neither
+        // can be salvaged here, and the backend rebuilds the engine from the flag either way.
+        const VkResult WAITSTATE = vkWaitForFences(m_impl->device, 1, &SLOT.fence, VK_TRUE, 1000000000);
+        if (WAITSTATE != VK_SUCCESS) {
             m_bad = true;
-            log(AQ_LOG_ERROR, "drm: MSC: a copy slot never signalled, disabling the copy engine");
+            if (WAITSTATE == VK_ERROR_DEVICE_LOST)
+                log(AQ_LOG_ERROR, "drm: MSC: the compose device was lost, the copy engine will be rebuilt");
+            else
+                log(AQ_LOG_ERROR, std::format("drm: MSC: a copy slot never signalled (VkResult {}), the copy engine will be rebuilt", (int)WAITSTATE));
             return false;
         }
     }
@@ -671,7 +708,8 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     }
 
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (vkResetCommandBuffer(SLOT.command, 0) != VK_SUCCESS || vkBeginCommandBuffer(SLOT.command, &begin) != VK_SUCCESS)
+    if (!checkResult(vkResetCommandBuffer(SLOT.command, 0), "resetting a copy command buffer") ||
+        !checkResult(vkBeginCommandBuffer(SLOT.command, &begin), "beginning a copy command buffer"))
         return false;
 
     // The cached image is owned by the foreign family between copies: each copy acquires it
@@ -703,21 +741,28 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
                                     .image               = SOURCE.image,
                                     .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(SLOT.command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
-    if (vkEndCommandBuffer(SLOT.command) != VK_SUCCESS)
+    if (!checkResult(vkEndCommandBuffer(SLOT.command), "ending a copy command buffer"))
         return false;
 
-    VkSemaphore          WAITSEM   = SLOT.incoming;
-    VkPipelineStageFlags WAITSTAGE = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo         submit    = {.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                      .waitSemaphoreCount   = gpuWait ? 1u : 0u,
-                                      .pWaitSemaphores      = gpuWait ? &WAITSEM : nullptr,
-                                      .pWaitDstStageMask    = gpuWait ? &WAITSTAGE : nullptr,
-                                      .commandBufferCount   = 1,
-                                      .pCommandBuffers      = &SLOT.command,
-                                      .signalSemaphoreCount = 1,
-                                      .pSignalSemaphores    = &SLOT.outgoing};
-    if (vkResetFences(m_impl->device, 1, &SLOT.fence) != VK_SUCCESS || vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence) != VK_SUCCESS)
+    VkSemaphore          WAITSEM      = SLOT.incoming;
+    VkPipelineStageFlags WAITSTAGE    = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo         submit       = {.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                         .waitSemaphoreCount   = gpuWait ? 1u : 0u,
+                                         .pWaitSemaphores      = gpuWait ? &WAITSEM : nullptr,
+                                         .pWaitDstStageMask    = gpuWait ? &WAITSTAGE : nullptr,
+                                         .commandBufferCount   = 1,
+                                         .pCommandBuffers      = &SLOT.command,
+                                         .signalSemaphoreCount = 1,
+                                         .pSignalSemaphores    = &SLOT.outgoing};
+    VkResult             submitResult = vkResetFences(m_impl->device, 1, &SLOT.fence);
+    if (submitResult == VK_SUCCESS)
+        submitResult = vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence);
+    if (submitResult != VK_SUCCESS) {
+        log(AQ_LOG_ERROR, std::format("drm: MSC: submitting the copy failed (VkResult {})", (int)submitResult));
+        if (submitResult == VK_ERROR_DEVICE_LOST)
+            m_bad = true; // the device went with the submit; the backend rebuilds the engine
         return false;
+    }
 
     // The copy is in flight, so the import belongs to this slot until its fence signals.
     SLOT.sourceId = SOURCE.id;

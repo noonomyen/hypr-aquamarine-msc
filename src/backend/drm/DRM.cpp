@@ -1492,23 +1492,53 @@ bool Aquamarine::CDRMBackend::mscEnabled() {
     return envEnabled("AQ_MSC");
 }
 
-SP<CMSCTransfer> Aquamarine::CDRMBackend::mscTransfer() {
+// A copy that failed fatally, or a slot that never signalled, leaves a transfer that cannot
+// work again: what died is the Vulkan device underneath it. Rebuilding one is bounded, so a
+// compose device that keeps dying cannot turn into a rebuild loop.
+// Deliberate simplification: the budget is per failure episode. It is only spent while engines
+// keep failing, and cleared once a rebuilt engine has actually copied a frame.
+static constexpr uint32_t MSC_MAX_ATTEMPTS = 4;
+
+SP<CMSCTransfer>          Aquamarine::CDRMBackend::mscTransfer() {
     if (!mscEnabled())
         return nullptr;
 
-    if (!msc && !mscTried) {
-        mscTried = true;
-        // scanGPUs validated this already: transfer or graphics, nothing else reaches here
-        const char* queue         = getenv("AQ_MSC_QUEUE");
-        const bool  useCopyEngine = !queue || std::string{queue} == "transfer";
-        msc                       = CMSCTransfer::create(self, backend.lock(), useCopyEngine);
-        if (!msc)
-            backend->log(AQ_LOG_ERROR, std::format("drm: MSC: no Vulkan copy engine for the compose GPU {}", gpu ? gpu->path : "<unknown>"));
-        else
-            backend->log(AQ_LOG_DEBUG,
-                         std::format("drm: MSC ready (copy {}, queue {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_COPY"),
-                                     queue ? queue : "<unset>", gpu->path));
+    if (msc && !msc->good()) {
+        backend->log(AQ_LOG_DEBUG, std::format("drm: MSC: the copy engine failed, rebuilding it on {}", gpu ? gpu->path : "<unknown>"));
+        // Dropping the transfer and its allocator is enough: every destination swapchain was
+        // allocated by that allocator, so the next buffer request notices the change and
+        // reallocates (see CDRMOutput::mgpuNextBuffer). The old transfer lives until its last
+        // destination buffer is gone, which is what makes dropping the old device safe.
+        msc.reset();
+        mscAlloc.reset();
+    } else if (msc && msc->copyCount() > mscCopiesAtBuild)
+        mscAttempts = 0; // this engine has copied frames, so the next failure is a new episode
+
+    if (msc)
+        return msc;
+
+    if (mscAttempts >= MSC_MAX_ATTEMPTS) {
+        if (!mscGaveUp) {
+            mscGaveUp = true;
+            backend->log(AQ_LOG_ERROR,
+                         std::format("drm: MSC: the copy engine failed {} times on {}; giving up, the outputs will freeze", mscAttempts, gpu ? gpu->path : "<unknown>"));
+        }
+        return nullptr;
     }
+
+    ++mscAttempts;
+    // scanGPUs validated this already: transfer or graphics, nothing else reaches here
+    const char* queue         = getenv("AQ_MSC_QUEUE");
+    const bool  useCopyEngine = !queue || std::string{queue} == "transfer";
+    msc                       = CMSCTransfer::create(self, backend.lock(), useCopyEngine);
+    if (msc) {
+        mscCopiesAtBuild = msc->copyCount();
+        backend->log(AQ_LOG_DEBUG,
+                     std::format("drm: MSC ready (copy {}, queue {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_COPY"),
+                                 queue ? queue : "<unset>", gpu->path));
+    } else
+        backend->log(AQ_LOG_ERROR,
+                     std::format("drm: MSC: no Vulkan copy engine for the compose GPU {} (attempt {}/{})", gpu ? gpu->path : "<unknown>", mscAttempts, MSC_MAX_ATTEMPTS));
 
     return msc;
 }
@@ -2531,7 +2561,14 @@ bool Aquamarine::CDRMOutput::mscReady(SP<CMSCTransfer>& transfer, SP<CMSCAllocat
     if (transfer && allocator)
         return true;
 
-    backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the scanout copy engine is unavailable; there is no blit fallback");
+    // Once the engine is out of attempts every commit lands here, so say it once rather than at
+    // the frame rate; the rebuild and give-up logs above carry the detail.
+    static bool loggedUnavailable = false;
+    if (!loggedUnavailable) {
+        loggedUnavailable = true;
+        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the scanout copy engine is unavailable; there is no blit fallback");
+    }
+
     return false;
 }
 
