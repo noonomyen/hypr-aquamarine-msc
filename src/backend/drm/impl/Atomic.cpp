@@ -11,6 +11,8 @@
 #include "Shared.hpp"
 #include "aquamarine/output/Output.hpp"
 
+#include <cstdlib>
+
 using namespace Aquamarine;
 using namespace Hyprutils::Memory;
 using namespace Hyprutils::Math;
@@ -140,6 +142,27 @@ void Aquamarine::CDRMAtomicRequest::add(uint32_t id, uint32_t prop, uint64_t val
     if (id == 0 || prop == 0) {
         backend->log(AQ_LOG_ERROR, "atomic drm request: failed to add prop: id / prop == 0");
         return;
+    }
+
+    // AQ_ATOMIC_DEBUG=1 dumps the request with real property names and blob
+    // sizes; capped so a retry loop cannot flood the log.
+    if (const auto DBGENV = getenv("AQ_ATOMIC_DEBUG"); DBGENV && std::string{DBGENV} != "0") {
+        static int dumpCount = 0;
+        if (dumpCount < 300) {
+            ++dumpCount;
+            const auto  PROP = drmModeGetProperty(backend->gpu->fd, prop);
+            std::string extra;
+            if (PROP && (PROP->flags & DRM_MODE_PROP_BLOB) && val) {
+                if (const auto BLOB = drmModeGetPropertyBlob(backend->gpu->fd, (uint32_t)val); BLOB) {
+                    extra = std::format(" blobLen {}", BLOB->length);
+                    drmModeFreePropertyBlob(BLOB);
+                } else
+                    extra = std::format(" blobLen ? (errno {})", errno);
+            }
+            backend->log(AQ_LOG_DEBUG, std::format("atomic prop obj {} {} = {}{}", id, PROP ? PROP->name : "?", val, extra));
+            if (PROP)
+                drmModeFreeProperty(PROP);
+        }
     }
 
     if (drmModeAtomicAddProperty(req, id, prop, val) < 0) {
@@ -398,7 +421,7 @@ bool Aquamarine::CDRMAtomicRequest::commit(uint32_t flagssss) {
 
     if (auto ret = drmModeAtomicCommit(backend->gpu->fd, req, flagssss, rc<void*>(FLIPID)); ret) {
         backend->log((flagssss & DRM_MODE_ATOMIC_TEST_ONLY) ? AQ_LOG_DEBUG : AQ_LOG_ERROR,
-                     std::format("atomic drm request: failed to commit: {}, flags: {}", strerror(ret == -1 ? errno : -ret), flagsToStr(flagssss)));
+                     std::format("atomic drm request: failed to commit: {} (ret {} errno {}), flags: {}", strerror(ret == -1 ? errno : -ret), ret, errno, flagsToStr(flagssss)));
 
         if (WANTSFLIP)
             conn->crtc->disarmPageFlip();

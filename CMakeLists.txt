@@ -34,6 +34,7 @@ pkg_check_modules(
   pixman-1
   libdrm
   gbm
+  vulkan
   libudev
   libdisplay-info
   hwdata)
@@ -158,6 +159,15 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
   COMMAND output "output")
 add_dependencies(tests output)
+
+add_executable(scanoutCopyFormat "tests/ScanoutCopyFormat.cpp")
+target_include_directories(scanoutCopyFormat PRIVATE "./src/backend/drm")
+target_link_libraries(scanoutCopyFormat PRIVATE PkgConfig::deps aquamarine)
+add_test(
+  NAME "scanoutCopyFormat"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
+  COMMAND scanoutCopyFormat "scanoutCopyFormat")
+add_dependencies(tests scanoutCopyFormat)
 
 add_executable(commitThread "tests/CommitThread.cpp")
 target_include_directories(commitThread PRIVATE "./src/backend/drm")

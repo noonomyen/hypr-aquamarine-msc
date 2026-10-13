@@ -19,6 +19,8 @@ namespace Aquamarine {
     struct SDRMConnector;
     class CDRMRenderer;
     class CDRMDumbAllocator;
+    class CMSCTransfer;
+    class CMSCAllocator;
     class CDRMCommitThread;
     class CDRMCursorPositionMailbox;
     class CDRMAsyncCommitData;
@@ -269,7 +271,11 @@ namespace Aquamarine {
         bool prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence, bool& mgpuAcquired,
                                     bool& requiresSync);
 
-        Hyprutils::Memory::CWeakPointer<CDRMBackend>                 backend;
+        bool mscReady(Hyprutils::Memory::CSharedPointer<CMSCTransfer>& transfer, Hyprutils::Memory::CSharedPointer<CMSCAllocator>& allocator);
+        Hyprutils::Memory::CSharedPointer<IBuffer>   mgpuNextBuffer(Hyprutils::Memory::CSharedPointer<IAllocator> allocator, Hyprutils::Memory::CSharedPointer<CSwapchain>& chain,
+                                                                    const Hyprutils::Math::Vector2D& size, uint32_t format, bool cursor, bool* syncRequired = nullptr);
+
+        Hyprutils::Memory::CWeakPointer<CDRMBackend> backend;
         Hyprutils::Memory::CSharedPointer<SDRMConnector>             connector;
         Hyprutils::Memory::CSharedPointer<std::function<void(void)>> frameIdle;
         Hyprutils::Signal::CHyprSignalListener                       frameReadyListener;
@@ -486,10 +492,15 @@ namespace Aquamarine {
         std::string                                                        gpuName;
         virtual int                                                        drmRenderNodeFD();
         virtual eBackendGPUDriver                                          gpuDriver();
-        Hyprutils::Memory::CSharedPointer<SDRMCRTC>                        crtcByID(uint32_t id);
 
-        void                                                               dispatchCommitResults();
-        void                                                               handlePageFlip(uintptr_t flipID, unsigned int seq, unsigned int sec, unsigned int usec, uint32_t crtcID);
+        // MSC (AQ_MSC=1, engine vulkan): primary-GPU Vulkan copy into a linear destination.
+        bool                                             mscEnabled();
+        Hyprutils::Memory::CSharedPointer<CMSCTransfer>  mscTransfer();
+        Hyprutils::Memory::CSharedPointer<CMSCAllocator> mscAllocator();
+        Hyprutils::Memory::CSharedPointer<SDRMCRTC>      crtcByID(uint32_t id);
+
+        void                                             dispatchCommitResults();
+        void                                             handlePageFlip(uintptr_t flipID, unsigned int seq, unsigned int sec, unsigned int usec, uint32_t crtcID);
 
       private:
         CDRMBackend(Hyprutils::Memory::CSharedPointer<CBackend> backend);
@@ -548,6 +559,10 @@ namespace Aquamarine {
         std::chrono::microseconds                                     commitLeadTime = std::chrono::microseconds{2000};
 
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
+
+        Hyprutils::Memory::CSharedPointer<CMSCTransfer>               msc;
+        bool                                                          mscTried = false;
+        Hyprutils::Memory::CSharedPointer<CMSCAllocator>              mscAlloc;
 
         bool                                                          atomic = false;
 

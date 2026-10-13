@@ -5,6 +5,7 @@
 #include <aquamarine/backend/drm/Atomic.hpp>
 #include <aquamarine/allocator/GBM.hpp>
 #include <aquamarine/allocator/DRMDumb.hpp>
+#include "ScanoutCopy.hpp"
 #include <cstdint>
 #include <format>
 #include <hyprutils/math/Mat3x3.hpp>
@@ -20,6 +21,7 @@
 #include <utility>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 extern "C" {
 #include <libseat.h>
@@ -197,6 +199,80 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
 
     udev_enumerate_unref(enumerate);
 
+    auto findScanned = [&devices](const char* want) -> SP<CSessionDevice> {
+        std::error_code ec;
+        const auto      CANON = std::filesystem::canonical(want, ec);
+        if (ec)
+            return nullptr;
+
+        for (auto const& vd : devices) {
+            std::error_code cec;
+            auto            vcanon = std::filesystem::canonical(vd->path, cec);
+            if (cec)
+                vcanon = vd->path;
+            if (vcanon == CANON)
+                return vd;
+        }
+
+        return nullptr;
+    };
+
+    // MSC is opt-in and demands explicit roles:
+    //   AQ_MSC=0|1            switch
+    //   AQ_MSC_ENGINE=<name>  copy engine
+    //   AQ_MSC_DISPLAY=<path> gpu display (display only)
+    //   AQ_MSC_COMPOSE=<path> gpu compose
+    // Everything here is skipped when AQ_MSC is not enabled, so the unpatched
+    // device selection (AQ_DRM_DEVICES / auto) is untouched.
+    const char* mscEnable     = getenv("AQ_MSC");
+    const bool  mscRequested  = mscEnable && *mscEnable && std::string{mscEnable} != "0";
+    const char* mscEngine     = getenv("AQ_MSC_ENGINE");
+    const char* composeDevice = getenv("AQ_MSC_COMPOSE");
+    const char* displayDevice = getenv("AQ_MSC_DISPLAY");
+
+    if (mscRequested) {
+        if (std::string{mscEnable} != "1") {
+            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC={} is not valid; enable MSC with AQ_MSC=1", mscEnable));
+            return {};
+        }
+
+        if (!mscEngine || std::string{mscEngine} != "vulkan") {
+            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_ENGINE must be vulkan (got {}), refusing to start", mscEngine ? mscEngine : "<unset>"));
+            return {};
+        }
+
+        if (!composeDevice || !displayDevice) {
+            backend->log(AQ_LOG_ERROR, "drm: AQ_MSC=1 requires AQ_MSC_COMPOSE and AQ_MSC_DISPLAY, refusing to start with unpinned GPU roles");
+            return {};
+        }
+
+        backend->log(AQ_LOG_DEBUG, std::format("drm: MSC roles compose={} display={} engine={}", composeDevice, displayDevice, mscEngine));
+
+        const auto COMPOSE = findScanned(composeDevice);
+        const auto DISPLAY = findScanned(displayDevice);
+
+        if (!COMPOSE || !DISPLAY) {
+            backend->log(AQ_LOG_ERROR,
+                         std::format("drm: AQ_MSC_COMPOSE / AQ_MSC_DISPLAY not found (compose {}, display {})", COMPOSE ? "ok" : "missing", DISPLAY ? "ok" : "missing"));
+            return {};
+        }
+
+        backend->log(AQ_LOG_DEBUG, std::format("drm: compose GPU {} (renders + copies), display GPU {} (scanout only)", COMPOSE->path, DISPLAY->path));
+
+        // Say out loud what we are not managing: with MSC the roles are exactly
+        // these two, so an extra GPU (an eGPU, most likely) is left alone and its
+        // outputs will not be driven. Silence here would look like a dead port.
+        for (const auto& d : devices) {
+            if (d == COMPOSE || d == DISPLAY)
+                continue;
+
+            backend->log(AQ_LOG_DEBUG,
+                         std::format("drm: MSC: ignoring {} (not compose/display); its outputs stay unmanaged, set AQ_MSC_DISPLAY to use it or run with AQ_MSC=0", d->path));
+        }
+
+        return {COMPOSE, DISPLAY};
+    }
+
     std::vector<SP<CSessionDevice>> vecDevices;
 
     auto                            explicitGpus = getenv("AQ_DRM_DEVICES");
@@ -221,25 +297,10 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
         }
 
         for (auto const& d : explicitDevices) {
-            bool found = false;
-            for (auto const& vd : devices) {
-                std::error_code ec;
-                auto            canonicalFilePath = std::filesystem::canonical(vd->path, ec);
-                if (ec) {
-                    backend->log(AQ_LOG_ERROR, std::format("drm: Failed to canonicalize path {}", d));
-                    canonicalFilePath = vd->path;
-                }
-
-                if (canonicalFilePath == d) {
-                    vecDevices.emplace_back(vd);
-                    found = true;
-                    break;
-                }
-            }
-
-            if (found)
+            if (const auto DEV = findScanned(d.c_str()); DEV) {
+                vecDevices.emplace_back(DEV);
                 backend->log(AQ_LOG_DEBUG, std::format("drm: Explicit device {} found", d));
-            else
+            } else
                 backend->log(AQ_LOG_ERROR, std::format("drm: Explicit device {} not found", d));
         }
     } else {
@@ -903,6 +964,11 @@ bool Aquamarine::CDRMBackend::updateSecondaryRendererState(DRMFBList* deferred) 
     const bool hasEnabledOutputs = std::ranges::any_of(connectors, [](const auto& c) { return c->status == DRM_MODE_CONNECTED && c->output && c->output->enabledState; });
 
     if (hasEnabledOutputs) {
+        if (mscEnabled()) {
+            // MSC copies on the compose GPU; the display GPU must never create a renderer.
+            return true;
+        }
+
         if (rendererState.renderer && rendererState.allocator)
             return true;
 
@@ -910,10 +976,15 @@ bool Aquamarine::CDRMBackend::updateSecondaryRendererState(DRMFBList* deferred) 
         return initMgpu();
     }
 
-    if (!rendererState.renderer && !rendererState.allocator)
+    // Under MSC there is no renderer to gate on, so also look at the mgpu objects
+    // the outputs hold: without this the release loop below is never reached and the
+    // destination buffers survive DPMS-off/disconnect.
+    const bool hasMgpuResources = std::ranges::any_of(connectors, [](const auto& c) { return c->output && (c->output->mgpu.swapchain || c->output->mgpu.cursorSwapchain); });
+
+    if (!rendererState.renderer && !rendererState.allocator && !hasMgpuResources)
         return true;
 
-    backend->log(AQ_LOG_DEBUG, std::format("drm: Deinitializing secondary renderer on {}, no enabled outputs", gpu->path));
+    backend->log(AQ_LOG_DEBUG, std::format("drm: Releasing multi-GPU resources on {}, no enabled outputs", gpu->path));
 
     DRMFBList retired;
     for (auto const& c : connectors) {
@@ -1381,6 +1452,55 @@ int Aquamarine::CDRMBackend::drmRenderNodeFD() {
 
 eBackendGPUDriver Aquamarine::CDRMBackend::gpuDriver() {
     return driver;
+}
+
+// Debug: commit without handing the copy fence to KMS, to tell a bad destination
+// framebuffer apart from a fence KMS refuses. The display can show a destination that
+// is still being written.
+static bool mscFencesDisabled() {
+    return envEnabled("AQ_MSC_NO_FENCE");
+}
+
+// KMS only takes a copy fence when the CRTC supports explicit sync, and the cursor copy
+// never hands one over at all, so in those cases the copy has to be complete first.
+static bool mscWaitCopyFence(int fd) {
+    pollfd p = {.fd = fd, .events = POLLIN};
+    while (poll(&p, 1, 1000) == -1 && errno == EINTR) {}
+    return (p.revents & POLLIN) != 0;
+}
+
+bool Aquamarine::CDRMBackend::mscEnabled() {
+    // scanGPUs already refuses to start when AQ_MSC is set to anything but 1,
+    // so this is the switch and nothing else.
+    return envEnabled("AQ_MSC");
+}
+
+SP<CMSCTransfer> Aquamarine::CDRMBackend::mscTransfer() {
+    if (!mscEnabled())
+        return nullptr;
+
+    if (!msc && !mscTried) {
+        mscTried = true;
+        msc      = CMSCTransfer::create(self, backend.lock());
+        if (!msc)
+            backend->log(AQ_LOG_ERROR, std::format("drm: MSC: no Vulkan copy engine for the compose GPU {}", gpu ? gpu->path : "<unknown>"));
+        else
+            backend->log(
+                AQ_LOG_DEBUG,
+                std::format("drm: MSC ready (engine {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_ENGINE"), gpu->path));
+    }
+
+    return msc;
+}
+
+SP<CMSCAllocator> Aquamarine::CDRMBackend::mscAllocator() {
+    if (!mscTransfer())
+        return nullptr;
+
+    if (!mscAlloc)
+        mscAlloc = CMSCAllocator::create(msc, backend.lock());
+
+    return mscAlloc;
 }
 
 uintptr_t Aquamarine::CDRMBackend::nextPageFlipID() {
@@ -2383,6 +2503,63 @@ void Aquamarine::CDRMOutput::setCursorVisible(bool visible) {
     scheduleFrame(AQ_SCHEDULE_CURSOR_VISIBLE);
 }
 
+bool Aquamarine::CDRMOutput::mscReady(SP<CMSCTransfer>& transfer, SP<CMSCAllocator>& allocator) {
+    const auto PRIMARY = backend->primary.lock();
+    transfer           = PRIMARY ? PRIMARY->mscTransfer() : nullptr;
+    allocator          = PRIMARY ? PRIMARY->mscAllocator() : nullptr;
+
+    if (transfer && allocator)
+        return true;
+
+    backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the scanout copy engine is unavailable; there is no blit fallback");
+    return false;
+}
+
+// The destination of every scanout copy comes from the copy allocator. The synchronous and
+// cursor paths reconfigure immediately; the asynchronous one refuses a stale destination and
+// asks for a sync commit instead, so a reallocation cannot land behind a copy already in flight.
+SP<IBuffer> Aquamarine::CDRMOutput::mgpuNextBuffer(SP<IAllocator> allocator, SP<CSwapchain>& chain, const Hyprutils::Math::Vector2D& size, uint32_t format, bool cursor,
+                                                   bool* syncRequired) {
+    if (!chain || chain->getAllocator() != allocator)
+        chain = CSwapchain::create(allocator, backend.lock());
+
+    auto OPTIONS = cursor ? chain->currentOptions() : (swapchain ? swapchain->currentOptions() : chain->currentOptions());
+    OPTIONS.size = size;
+    if (OPTIONS.format == DRM_FORMAT_INVALID)
+        OPTIONS.format = format;
+    OPTIONS.multigpu = false;
+    OPTIONS.cursor   = cursor;
+    OPTIONS.scanout  = true;
+    if (OPTIONS.length == 0)
+        OPTIONS.length = 2;
+    if (cursor) {
+        // The cursor chain is ours alone: take the source's format and a fixed length.
+        OPTIONS.format = format;
+        OPTIONS.length = 2;
+    }
+
+    if (syncRequired) {
+        const auto& CURRENT = chain->currentOptions();
+        if (CURRENT.length > 0 &&
+            (CURRENT.length != OPTIONS.length || CURRENT.size != OPTIONS.size || CURRENT.format != OPTIONS.format || CURRENT.multigpu != OPTIONS.multigpu ||
+             CURRENT.cursor != OPTIONS.cursor || CURRENT.scanout != OPTIONS.scanout)) {
+            *syncRequired = true;
+            return nullptr;
+        }
+    }
+
+    if (!chain->reconfigure(OPTIONS)) {
+        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: could not reconfigure the destination swapchain");
+        return nullptr;
+    }
+
+    auto next = chain->next(nullptr);
+    if (!next)
+        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the destination swapchain has no buffer");
+
+    return next;
+}
+
 bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence,
                                                     bool& mgpuAcquired, bool& requiresSync) {
     const auto& STATE = snapshot.state();
@@ -2393,7 +2570,34 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
     data.cursorVisible = cursorVisible;
 
     SP<CDRMFB> drmFB;
-    if (backend->shouldBlit()) {
+    if (backend->shouldBlit() && backend->mscEnabled() && backend->primary) {
+        SP<CMSCTransfer>  MSC;
+        SP<CMSCAllocator> MSCALLOC;
+        if (!mscReady(MSC, MSCALLOC))
+            return false;
+
+        auto NEW_BUFFER = mgpuNextBuffer(MSCALLOC, mgpu.swapchain, STATE.buffer->size, STATE.buffer->dmabuf().format, false, &requiresSync);
+        if (!NEW_BUFFER)
+            return false;
+        mgpuAcquired = true;
+
+        Hyprutils::OS::CFileDescriptor copyFence;
+        const int                      WAITFD = (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
+        if (!MSC->copy(STATE.buffer, NEW_BUFFER, WAITFD, copyFence)) {
+            backend->log(AQ_LOG_ERROR, "drm: MSC async copy failed");
+            return false;
+        }
+
+        if (!copyFence.isValid() || !supportsExplicit || mscFencesDisabled()) {
+            requiresSync = true;
+            return false;
+        }
+
+        mgpuFence                        = std::move(copyFence);
+        data.outputState.explicitInFence = mgpuFence.get();
+
+        drmFB = CDRMFB::create(NEW_BUFFER, backend, nullptr);
+    } else if (backend->shouldBlit()) {
         if (!backend->rendererState.renderer) {
             backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
             if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
@@ -2628,7 +2832,9 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     data.cursorVisible = cursorVisible;
 
     // A commit that carries no new buffer has nothing to blit: STATE.buffer is the one we already copied
-    SP<CDRMFB> blittedFB;
+    SP<CDRMFB>                     blittedFB;
+    Hyprutils::OS::CFileDescriptor mscFence;
+    bool                           mscFenceProvided = false;
     if (backend->shouldBlit() && !(COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER)) {
         const auto& LAST = connector->crtc->primary->back ? connector->crtc->primary->back : connector->crtc->primary->front;
         if (LAST && !LAST->dead)
@@ -2643,61 +2849,104 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         if (blittedFB)
             drmFB = blittedFB;
         else if (backend->shouldBlit()) {
-            if (!backend->rendererState.renderer) {
-                backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
-                if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
-                    backend->backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for blitting");
+            if (backend->mscEnabled() && backend->primary) {
+                // MSC: copy the primary buffer into a linear destination the output scans out.
+                SP<CMSCTransfer>  MSC;
+                SP<CMSCAllocator> MSCALLOC;
+                if (!mscReady(MSC, MSCALLOC))
+                    return false;
+
+                auto NEWAQBUF = mgpuNextBuffer(MSCALLOC, mgpu.swapchain, STATE.buffer->size, STATE.buffer->dmabuf().format, false);
+                if (!NEWAQBUF)
+                    return false;
+
+                const int WAITFD = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
+                if (!MSC->copy(STATE.buffer, NEWAQBUF, WAITFD, mscFence)) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: MSC copy failed");
                     return false;
                 }
+
+                static bool loggedDst = false;
+                if (!loggedDst) {
+                    loggedDst      = true;
+                    const auto DST = NEWAQBUF->dmabuf();
+                    backend->backend->log(AQ_LOG_DEBUG,
+                                          std::format("drm: MSC dst fb fourcc {:#x} modifier {:#x} {}x{} planes {} stride[0] {} offset[0] {}", DST.format, DST.modifier,
+                                                      (int)DST.size.x, (int)DST.size.y, DST.planes, DST.strides[0], DST.offsets[0]));
+                }
+
+                if (mscFencesDisabled()) {
+                    backend->backend->log(AQ_LOG_DEBUG, "drm: MSC: AQ_MSC_NO_FENCE set, committing without the copy fence");
+                } else if (mscFence.isValid() && !supportsExplicit) {
+                    // KMS would drop the fence, so wait for the copy here rather than let the
+                    // display fetch a destination that is still being written.
+                    if (!mscWaitCopyFence(mscFence.get())) {
+                        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the copy did not complete in time");
+                        return false;
+                    }
+                } else
+                    mscFenceProvided = mscFence.isValid();
+
+                data.outputState.explicitInFence = mscFenceProvided ? mscFence.get() : -1;
+
+                drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr);
+            } else {
+                if (!backend->rendererState.renderer) {
+                    backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
+                    if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
+                        backend->backend->log(AQ_LOG_ERROR, "drm: Failed to initialize renderer backend for blitting");
+                        return false;
+                    }
+                }
+
+                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
+
+                if (!mgpu.swapchain) {
+                    TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
+                    mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
+                }
+
+                auto OPTIONS = swapchain->currentOptions();
+                auto bufDma  = STATE.buffer->dmabuf();
+                OPTIONS.size = STATE.buffer->size;
+                if (OPTIONS.format == DRM_FORMAT_INVALID)
+                    OPTIONS.format = bufDma.format;
+                OPTIONS.multigpu = false; // this is not a shared swapchain, and additionally, don't make it linear, nvidia would be mad
+                OPTIONS.cursor   = false;
+                OPTIONS.scanout  = true;
+                if (OPTIONS.length == 0) // releaseMgpuResources() cleared the swapchain and we committed without updating it.
+                    OPTIONS.length = 2;
+                if (!mgpu.swapchain->reconfigure(OPTIONS)) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
+                    return false;
+                }
+
+                auto NEWAQBUF = mgpu.swapchain->next(nullptr);
+                if (!NEWAQBUF) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
+                    return false;
+                }
+
+                SP<Aquamarine::CDRMRenderer> primaryRenderer;
+                if (backend->primary)
+                    primaryRenderer = backend->primary->rendererState.renderer;
+                auto blitResult = backend->rendererState.renderer->blit(
+                    STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+                if (!blitResult.success) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+                    return false;
+                }
+
+                // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
+                // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
+                static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+                if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
+                    data.outputState.explicitInFence = blitResult.syncFD.value();
+                else
+                    data.outputState.explicitInFence = -1;
+
+                drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
             }
-
-            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
-
-            if (!mgpu.swapchain) {
-                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
-                mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
-            }
-
-            auto OPTIONS = swapchain->currentOptions();
-            auto bufDma  = STATE.buffer->dmabuf();
-            OPTIONS.size = STATE.buffer->size;
-            if (OPTIONS.format == DRM_FORMAT_INVALID)
-                OPTIONS.format = bufDma.format;
-            OPTIONS.multigpu = false; // this is not a shared swapchain, and additionally, don't make it linear, nvidia would be mad
-            OPTIONS.cursor   = false;
-            OPTIONS.scanout  = true;
-            if (OPTIONS.length == 0) // releaseMgpuResources() cleared the swapchain and we committed without updating it.
-                OPTIONS.length = 2;
-            if (!mgpu.swapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
-                return false;
-            }
-
-            auto NEWAQBUF = mgpu.swapchain->next(nullptr);
-            if (!NEWAQBUF) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
-                return false;
-            }
-
-            SP<Aquamarine::CDRMRenderer> primaryRenderer;
-            if (backend->primary)
-                primaryRenderer = backend->primary->rendererState.renderer;
-            auto blitResult = backend->rendererState.renderer->blit(
-                STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
-            if (!blitResult.success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
-                return false;
-            }
-
-            // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
-            // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
-            static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
-            if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
-                data.outputState.explicitInFence = blitResult.syncFD.value();
-            else
-                data.outputState.explicitInFence = -1;
-
-            drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
         } else
             drmFB = CDRMFB::create(STATE.buffer, backend, nullptr); // will return attachment if present
 
@@ -2754,6 +3003,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     data.test      = onlyTest;
     data.enabled   = STATE.enabled;
     data.committed = COMMITTED;
+    if (mscFenceProvided)
+        data.committed |= COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE;
     if (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE)
         data.damage = STATE.damage.copy();
     if (MODE->modeInfo.has_value())
@@ -2767,7 +3018,10 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     // making larger modes unreachable.
     // If the consumer already reconfigured the swapchain to the new size, attach a fresh buffer from it.
     bool acquiredModesetBuffer = false;
-    if (data.modeset && data.mainFB && swapchain && data.mainFB->buffer->size != MODE->pixelSize && swapchain->currentOptions().size == MODE->pixelSize) {
+    // With MSC the framebuffer is our linear copy of the current source; swapping in
+    // a buffer from the source swapchain here would leave the copy fence attached to
+    // a buffer nothing wrote to.
+    if (!mscFenceProvided && data.modeset && data.mainFB && swapchain && data.mainFB->buffer->size != MODE->pixelSize && swapchain->currentOptions().size == MODE->pixelSize) {
         if (auto newBuf = swapchain->next(nullptr); newBuf) {
             if (auto newFB = CDRMFB::create(newBuf, backend, nullptr); newFB && !newFB->dead) {
                 data.mainFB           = newFB;
@@ -2869,7 +3123,37 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 
         SP<CDRMFB> fb;
 
-        if (backend->primary) {
+        if (backend->primary && backend->mscEnabled() && bufferType == eBufferType::BUFFER_TYPE_DMABUF) {
+            SP<CMSCTransfer>  MSC;
+            SP<CMSCAllocator> MSCALLOC;
+            if (!mscReady(MSC, MSCALLOC))
+                return false;
+
+            const auto ATTRS    = buffer->dmabuf();
+            auto       NEWAQBUF = mgpuNextBuffer(MSCALLOC, mgpu.cursorSwapchain, ATTRS.size, ATTRS.format, true);
+            if (!NEWAQBUF)
+                return false;
+
+            Hyprutils::OS::CFileDescriptor copyFence;
+            if (!MSC->copy(buffer, NEWAQBUF, -1, copyFence)) {
+                backend->backend->log(AQ_LOG_ERROR, "drm: MSC cursor copy failed");
+                return false;
+            }
+
+            // A commit that programs the cursor plane does not always carry the copy fence,
+            // so the copy has to be complete before the framebuffer can be scanned out.
+            if (copyFence.isValid() && !mscWaitCopyFence(copyFence.get())) {
+                backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the cursor copy did not complete in time");
+                return false;
+            }
+
+            fb = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
+        } else if (backend->primary && backend->mscEnabled()) {
+            // No blit fallback exists under MSC and a shared-memory cursor would bring the
+            // display GPU's renderer back up, so refuse it instead of silently degrading.
+            backend->backend->log(AQ_LOG_ERROR, "drm: MSC: only dmabuf cursors are supported, refusing the shared-memory cursor");
+            return false;
+        } else if (backend->primary) {
             TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires cursor blit, blitting"));
 
             if (!backend->rendererState.renderer || !backend->rendererState.allocator) {
@@ -2882,7 +3166,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 
             // TODO: will this not implode on drm_dumb?!
 
-            if (!mgpu.cursorSwapchain) {
+            if (!mgpu.cursorSwapchain || mgpu.cursorSwapchain->getAllocator() != backend->rendererState.allocator) {
                 TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No cursorSwapchain for blit, creating"));
                 mgpu.cursorSwapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
             }
