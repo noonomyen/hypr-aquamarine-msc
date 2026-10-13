@@ -217,16 +217,19 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
         return nullptr;
     };
 
-    // MSC is opt-in and demands explicit roles:
-    //   AQ_MSC=0|1            switch
-    //   AQ_MSC_ENGINE=<name>  copy engine
-    //   AQ_MSC_DISPLAY=<path> gpu display (display only)
-    //   AQ_MSC_COMPOSE=<path> gpu compose
+    // MSC is opt-in and demands explicit choices:
+    //   AQ_MSC=0|1              switch
+    //   AQ_MSC_COPY=<name>      how the copy is performed (vulkan only)
+    //   AQ_MSC_QUEUE=<name>     queue family the copy runs on: transfer (the async copy
+    //                           engine, so it does not compete with rendering) or graphics
+    //   AQ_MSC_DISPLAY=<path>   gpu display (display only)
+    //   AQ_MSC_COMPOSE=<path>   gpu compose
     // Everything here is skipped when AQ_MSC is not enabled, so the unpatched
     // device selection (AQ_DRM_DEVICES / auto) is untouched.
     const char* mscEnable     = getenv("AQ_MSC");
     const bool  mscRequested  = mscEnable && *mscEnable && std::string{mscEnable} != "0";
-    const char* mscEngine     = getenv("AQ_MSC_ENGINE");
+    const char* mscCopy       = getenv("AQ_MSC_COPY");
+    const char* mscQueue      = getenv("AQ_MSC_QUEUE");
     const char* composeDevice = getenv("AQ_MSC_COMPOSE");
     const char* displayDevice = getenv("AQ_MSC_DISPLAY");
 
@@ -236,8 +239,13 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
             return {};
         }
 
-        if (!mscEngine || std::string{mscEngine} != "vulkan") {
-            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_ENGINE must be vulkan (got {}), refusing to start", mscEngine ? mscEngine : "<unset>"));
+        if (!mscCopy || std::string{mscCopy} != "vulkan") {
+            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_COPY must be vulkan (got {}), refusing to start", mscCopy ? mscCopy : "<unset>"));
+            return {};
+        }
+
+        if (!mscQueue || (std::string{mscQueue} != "transfer" && std::string{mscQueue} != "graphics")) {
+            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_QUEUE must be transfer or graphics (got {}), refusing to start", mscQueue ? mscQueue : "<unset>"));
             return {};
         }
 
@@ -246,7 +254,7 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
             return {};
         }
 
-        backend->log(AQ_LOG_DEBUG, std::format("drm: MSC roles compose={} display={} engine={}", composeDevice, displayDevice, mscEngine));
+        backend->log(AQ_LOG_DEBUG, std::format("drm: MSC roles compose={} display={} copy={} queue={}", composeDevice, displayDevice, mscCopy, mscQueue));
 
         const auto COMPOSE = findScanned(composeDevice);
         const auto DISPLAY = findScanned(displayDevice);
@@ -435,6 +443,15 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
 
         // so that session can handle udev change/remove events for this gpu
         backend->session->sessionDevices.push_back(gpu);
+    }
+
+    // MSC: build the copy engine here, now that the roles are fixed. A queue family the
+    // device does not have, or a Vulkan copy engine that cannot be created at all, is a
+    // configuration error: fail the scan so the session refuses to start instead of coming
+    // up with every output black.
+    if (newPrimary && newPrimary->mscEnabled() && !newPrimary->mscTransfer()) {
+        backend->log(AQ_LOG_ERROR, "drm: MSC: the copy engine could not be built, refusing to start");
+        return {};
     }
 
     return backends;
@@ -1481,13 +1498,16 @@ SP<CMSCTransfer> Aquamarine::CDRMBackend::mscTransfer() {
 
     if (!msc && !mscTried) {
         mscTried = true;
-        msc      = CMSCTransfer::create(self, backend.lock());
+        // scanGPUs validated this already: transfer or graphics, nothing else reaches here
+        const char* queue         = getenv("AQ_MSC_QUEUE");
+        const bool  useCopyEngine = !queue || std::string{queue} == "transfer";
+        msc                       = CMSCTransfer::create(self, backend.lock(), useCopyEngine);
         if (!msc)
             backend->log(AQ_LOG_ERROR, std::format("drm: MSC: no Vulkan copy engine for the compose GPU {}", gpu ? gpu->path : "<unknown>"));
         else
-            backend->log(
-                AQ_LOG_DEBUG,
-                std::format("drm: MSC ready (engine {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_ENGINE"), gpu->path));
+            backend->log(AQ_LOG_DEBUG,
+                         std::format("drm: MSC ready (copy {}, queue {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_COPY"),
+                                     queue ? queue : "<unset>", gpu->path));
     }
 
     return msc;

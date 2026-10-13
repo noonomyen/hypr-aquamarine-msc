@@ -493,7 +493,7 @@ namespace Aquamarine {
         virtual int                                                        drmRenderNodeFD();
         virtual eBackendGPUDriver                                          gpuDriver();
 
-        // MSC (AQ_MSC=1, engine vulkan): primary-GPU Vulkan copy into a linear destination.
+        // MSC (AQ_MSC=1, copy vulkan): primary-GPU Vulkan copy into a linear destination.
         bool                                             mscEnabled();
         Hyprutils::Memory::CSharedPointer<CMSCTransfer>  mscTransfer();
         Hyprutils::Memory::CSharedPointer<CMSCAllocator> mscAllocator();

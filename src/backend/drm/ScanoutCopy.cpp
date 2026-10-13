@@ -6,7 +6,6 @@
 #include <cstring>
 #include <iterator>
 #include <string_view>
-#include <hyprutils/utils/ScopeGuard.hpp>
 #include <vector>
 #include <drm_fourcc.h>
 #include <format>
@@ -18,7 +17,6 @@
 
 using namespace Aquamarine;
 using namespace Hyprutils::Memory;
-using Hyprutils::Utils::CScopeGuard;
 #define SP CSharedPointer
 #define WP CWeakPointer
 
@@ -120,10 +118,35 @@ struct CMSCTransfer::SImpl {
     VkDevice                       device           = VK_NULL_HANDLE;
     VkQueue                        queue            = VK_NULL_HANDLE;
     uint32_t                       queueFamily      = 0;
+    bool                           useCopyEngine    = true;
     VkCommandPool                  commandPool      = VK_NULL_HANDLE;
     PFN_vkImportSemaphoreFdKHR     importSemaphore  = nullptr;
     PFN_vkGetSemaphoreFdKHR        getSemaphoreFd   = nullptr;
     PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProps = nullptr;
+
+    // One imported source per compositor buffer, kept between copies. src is the identity
+    // of the producer's buffer, so an entry stays valid exactly as long as that buffer
+    // does; slotsUsing counts the copies whose slot has not come round yet.
+    struct SSource {
+        WP<IBuffer>    src;
+        VkImage        image    = VK_NULL_HANDLE;
+        VkDeviceMemory memory   = VK_NULL_HANDLE;
+        uint32_t       format   = 0;
+        uint64_t       modifier = 0;
+        uint64_t       width = 0, height = 0, stride = 0, offset = 0;
+        int            slotsUsing = 0;
+        uint64_t       lastUse    = 0;
+        uint64_t       id         = 0;
+
+        void           destroy(VkDevice dev) {
+            if (image)
+                vkDestroyImage(dev, image, nullptr);
+            if (memory)
+                vkFreeMemory(dev, memory, nullptr);
+            image  = VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+        }
+    };
 
     // A copy records into the slot whose fence has already signalled, so the copy's own
     // completion never has to be waited on the host before the next one can be recorded.
@@ -139,30 +162,36 @@ struct CMSCTransfer::SImpl {
         // One per slot: a slot is only reused once its fence signalled, so its previous
         // import is guaranteed to have been consumed by then.
         VkSemaphore incoming = VK_NULL_HANDLE;
-        // The imported source of this slot's last copy: it may only be released once that
-        // copy has completed, which the slot fence now tracks instead of a host wait.
-        VkImage        srcImage  = VK_NULL_HANDLE;
-        VkDeviceMemory srcMemory = VK_NULL_HANDLE;
+        // Which source import this slot's last copy read, so the entry can be marked idle
+        // once that copy has completed (the slot fence tracks that, not a host wait). The
+        // id, not an index: evicting an entry shifts the ones behind it.
+        uint64_t sourceId = 0;
     };
-    SSlot    slots[3];
-    size_t   nextSlot = 0;
-    uint64_t copies = 0, gpuWaits = 0, hostWaits = 0, slotWaits = 0;
+    std::vector<SSource> sources;
+    uint64_t             sourceCounter = 0, useCounter = 0;
+    SSlot                slots[3];
+    size_t               nextSlot = 0;
+    uint64_t             copies = 0, gpuWaits = 0, hostWaits = 0, slotWaits = 0;
+    // More than three copies can never be in flight, so a cache of this size always has an
+    // evictable entry.
+    static constexpr size_t MAXSOURCES = 16;
 
     // Copies are strictly serialized: one mutex for the whole transfer. Per-output
     // objects if two outputs ever need to copy concurrently.
     std::mutex mutex;
 };
 
-SP<CMSCTransfer> CMSCTransfer::create(WP<CDRMBackend> primary, SP<CBackend> logBackend) {
-    auto transfer  = SP<CMSCTransfer>(new CMSCTransfer(primary, logBackend));
+SP<CMSCTransfer> CMSCTransfer::create(WP<CDRMBackend> primary, SP<CBackend> logBackend, bool useCopyEngine) {
+    auto transfer  = SP<CMSCTransfer>(new CMSCTransfer(primary, logBackend, useCopyEngine));
     transfer->self = transfer;
     if (!transfer->good())
         return nullptr;
     return transfer;
 }
 
-CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend) : m_primary(primary), m_backend(logBackend) {
-    m_impl = std::make_unique<SImpl>();
+CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, bool useCopyEngine) : m_primary(primary), m_backend(logBackend) {
+    m_impl                = std::make_unique<SImpl>();
+    m_impl->useCopyEngine = useCopyEngine;
 
     if (getenv("DISPLAY") != nullptr)
         log(AQ_LOG_DEBUG, "drm: MSC: hiding DISPLAY while the copy engine initialises (the NVIDIA ICD opens X during init)");
@@ -245,12 +274,41 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend) : m
         log(AQ_LOG_DEBUG, std::format("drm: MSC: copy engine {} (vendor 0x{:x}) on render node {}:{}", props.deviceName, props.vendorID, TARGETMAJOR, TARGETMINOR));
     }
 
+    // AQ_MSC_QUEUE picks the family the copy is submitted to: transfer asks for the async
+    // copy engine (dedicated DMA hardware, so the copies do not compete with the compositor's
+    // rendering for the graphics engine), graphics for the graphics engine. Neither falls back.
     VkQueueFamilyProperties families[32];
     count = 32;
     vkGetPhysicalDeviceQueueFamilyProperties(m_impl->physical, &count, families);
-    for (uint32_t i = 0; i < count; ++i)
-        if (families[i].queueCount && (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
-            m_impl->queueFamily = i;
+    bool found = false;
+    if (m_impl->useCopyEngine) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!families[i].queueCount)
+                continue;
+            if ((families[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(families[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+                m_impl->queueFamily = i;
+                found               = true;
+                break;
+            }
+        }
+        if (!found)
+            log(AQ_LOG_ERROR, "drm: MSC: AQ_MSC_QUEUE=transfer, but this device exposes no transfer-only queue family; refusing to fall back to graphics");
+    } else {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (families[i].queueCount && (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                m_impl->queueFamily = i;
+                found               = true;
+            }
+        }
+        if (!found)
+            log(AQ_LOG_ERROR, "drm: MSC: AQ_MSC_QUEUE=graphics, but this device exposes no graphics queue family");
+    }
+    if (!found)
+        return;
+
+    // A transfer-only family executes transfer commands only: the copy and its barriers are
+    // transfer commands, but vkCmdClearColorImage is not, and it loses the device there.
+    log(AQ_LOG_DEBUG, std::format("drm: MSC: copy queue family {} ({})", m_impl->queueFamily, m_impl->useCopyEngine ? "transfer-only, the async copy engine" : "graphics"));
 
     float                   priority = 0;
     VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = m_impl->queueFamily, .queueCount = 1, .pQueuePriorities = &priority};
@@ -311,11 +369,10 @@ CMSCTransfer::~CMSCTransfer() {
                 vkDestroySemaphore(m_impl->device, SLOT.incoming, nullptr);
             if (SLOT.fence)
                 vkDestroyFence(m_impl->device, SLOT.fence, nullptr);
-            if (SLOT.srcImage)
-                vkDestroyImage(m_impl->device, SLOT.srcImage, nullptr);
-            if (SLOT.srcMemory)
-                vkFreeMemory(m_impl->device, SLOT.srcMemory, nullptr);
         }
+        for (auto& SOURCE : m_impl->sources)
+            SOURCE.destroy(m_impl->device);
+        m_impl->sources.clear();
         if (m_impl->commandPool)
             vkDestroyCommandPool(m_impl->device, m_impl->commandPool, nullptr);
         vkDestroyDevice(m_impl->device, nullptr);
@@ -417,6 +474,118 @@ SP<IBuffer> CMSCTransfer::allocateDestination(uint32_t fourcc, const Hyprutils::
     return SP<IBuffer>(new CMSCBuffer(self.lock(), (unsigned)size.x, (unsigned)size.y, fourcc));
 }
 
+// One import per producer buffer. An entry a slot still points at is never evicted, or a
+// later copy would read memory that has already been freed and handed out again.
+int CMSCTransfer::acquireSource(const SP<IBuffer>& src, const SDMABUFAttrs& attrs, VkFormat format) {
+    for (size_t i = 0; i < m_impl->sources.size(); ++i) {
+        const auto& SOURCE = m_impl->sources[i];
+        if (SOURCE.src == src && SOURCE.format == attrs.format && SOURCE.modifier == attrs.modifier && SOURCE.width == (uint64_t)attrs.size.x &&
+            SOURCE.height == (uint64_t)attrs.size.y && SOURCE.stride == attrs.strides[0] && SOURCE.offset == attrs.offsets[0])
+            return (int)i;
+    }
+
+    // Not seen before: make room for one more.
+    if (m_impl->sources.size() >= SImpl::MAXSOURCES) {
+        bool   haveVictim = false;
+        size_t victim     = 0;
+        for (size_t i = 0; i < m_impl->sources.size(); ++i) {
+            const auto& SOURCE = m_impl->sources[i];
+            if (SOURCE.slotsUsing > 0)
+                continue;
+            if (!haveVictim || SOURCE.lastUse < m_impl->sources[victim].lastUse) {
+                victim     = i;
+                haveVictim = true;
+            }
+        }
+        if (!haveVictim) {
+            log(AQ_LOG_ERROR, "drm: MSC: the source import cache is full and every entry is still in flight");
+            return -1;
+        }
+        m_impl->sources[victim].destroy(m_impl->device);
+        m_impl->sources.erase(m_impl->sources.begin() + (long)victim);
+    }
+
+    VkSubresourceLayout                           plane        = {.offset = attrs.offsets[0], .rowPitch = attrs.strides[0]};
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifierInfo = {.sType                       = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+                                                                  .drmFormatModifier           = attrs.modifier,
+                                                                  .drmFormatModifierPlaneCount = 1,
+                                                                  .pPlaneLayouts               = &plane};
+    VkExternalMemoryImageCreateInfo               external     = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &modifierInfo, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkImageCreateInfo imgInfo = {.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                 .pNext         = &external,
+                                 .imageType     = VK_IMAGE_TYPE_2D,
+                                 .format        = format,
+                                 .extent        = {(uint32_t)attrs.size.x, (uint32_t)attrs.size.y, 1},
+                                 .mipLevels     = 1,
+                                 .arrayLayers   = 1,
+                                 .samples       = VK_SAMPLE_COUNT_1_BIT,
+                                 .tiling        = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                                 .usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                 .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+                                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage           image   = VK_NULL_HANDLE;
+    if (vkCreateImage(m_impl->device, &imgInfo, nullptr, &image) != VK_SUCCESS)
+        return -1;
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(m_impl->device, image, &req);
+    VkMemoryFdPropertiesKHR fdProps = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    if (!m_impl->getMemoryFdProps || m_impl->getMemoryFdProps(m_impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, attrs.fds[0], &fdProps) != VK_SUCCESS) {
+        vkDestroyImage(m_impl->device, image, nullptr);
+        return -1;
+    }
+
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &mem);
+    const uint32_t allowed = req.memoryTypeBits & fdProps.memoryTypeBits;
+    VkDeviceMemory srcMem  = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && !srcMem; ++i) {
+        if (!(allowed & (1u << i)))
+            continue;
+        const int IMPORTFD = dup(attrs.fds[0]);
+        if (IMPORTFD < 0)
+            continue;
+        VkImportMemoryFdInfoKHR       import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = IMPORTFD};
+        VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &import, .image = image};
+        VkMemoryAllocateInfo          alloc     = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = i};
+        if (vkAllocateMemory(m_impl->device, &alloc, nullptr, &srcMem) != VK_SUCCESS) {
+            close(IMPORTFD);
+            srcMem = VK_NULL_HANDLE;
+            continue;
+        }
+    }
+    if (!srcMem || vkBindImageMemory(m_impl->device, image, srcMem, 0) != VK_SUCCESS) {
+        if (srcMem)
+            vkFreeMemory(m_impl->device, srcMem, nullptr);
+        vkDestroyImage(m_impl->device, image, nullptr);
+        return -1;
+    }
+
+    SImpl::SSource SOURCE;
+    SOURCE.src      = src;
+    SOURCE.image    = image;
+    SOURCE.memory   = srcMem;
+    SOURCE.format   = attrs.format;
+    SOURCE.modifier = attrs.modifier;
+    SOURCE.width    = (uint64_t)attrs.size.x;
+    SOURCE.height   = (uint64_t)attrs.size.y;
+    SOURCE.stride   = attrs.strides[0];
+    SOURCE.offset   = attrs.offsets[0];
+    SOURCE.id       = ++m_impl->sourceCounter;
+    m_impl->sources.emplace_back(std::move(SOURCE));
+    return (int)(m_impl->sources.size() - 1);
+}
+
+void CMSCTransfer::evictIdleSources() {
+    std::erase_if(m_impl->sources, [this](auto& SOURCE) {
+        if (SOURCE.slotsUsing > 0 || SOURCE.src.valid())
+            return false;
+        SOURCE.destroy(m_impl->device);
+        return true;
+    });
+}
+
 bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence) {
     if (!good() || !src || !dst)
         return false;
@@ -440,7 +609,7 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     // and the wait below is the only place the main thread can still wait for the GPU.
     auto& SLOT       = m_impl->slots[m_impl->nextSlot];
     m_impl->nextSlot = (m_impl->nextSlot + 1) % 3;
-    if (vkGetFenceStatus(m_impl->device, SLOT.fence) == VK_NOT_READY) {
+    if (vkGetFenceStatus(m_impl->device, SLOT.fence) != VK_SUCCESS) {
         ++m_impl->slotWaits;
         if (vkWaitForFences(m_impl->device, 1, &SLOT.fence, VK_TRUE, 1000000000) != VK_SUCCESS) {
             m_bad = true;
@@ -448,6 +617,24 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
             return false;
         }
     }
+
+    // The slot's previous copy has completed, so the source it read is idle again. Look the
+    // entry up by its id: the vector may have shifted since the copy was recorded.
+    if (SLOT.sourceId) {
+        for (auto& SOURCE : m_impl->sources) {
+            if (SOURCE.id == SLOT.sourceId) {
+                SOURCE.slotsUsing--;
+                break;
+            }
+        }
+        SLOT.sourceId = 0;
+    }
+    evictIdleSources();
+
+    const int SOURCEINDEX = acquireSource(src, SRCDMA, SRCFMT);
+    if (SOURCEINDEX < 0)
+        return false;
+    auto& SOURCE = m_impl->sources[(size_t)SOURCEINDEX];
 
     // Wait for the incoming fence on the GPU rather than on the host: import it as a
     // semaphore and let the queue wait on it. Host-waiting it here would block the
@@ -483,95 +670,20 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
         }
     }
 
-    // The slot's previous source image is only safe to release now that its copy completed.
-    if (SLOT.srcImage) {
-        vkDestroyImage(m_impl->device, SLOT.srcImage, nullptr);
-        SLOT.srcImage = VK_NULL_HANDLE;
-    }
-    if (SLOT.srcMemory) {
-        vkFreeMemory(m_impl->device, SLOT.srcMemory, nullptr);
-        SLOT.srcMemory = VK_NULL_HANDLE;
-    }
-
-    VkSubresourceLayout                           plane        = {.offset = SRCDMA.offsets[0], .rowPitch = SRCDMA.strides[0]};
-    VkImageDrmFormatModifierExplicitCreateInfoEXT modifierInfo = {.sType                       = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-                                                                  .drmFormatModifier           = SRCDMA.modifier,
-                                                                  .drmFormatModifierPlaneCount = 1,
-                                                                  .pPlaneLayouts               = &plane};
-    VkExternalMemoryImageCreateInfo               external     = {
-        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &modifierInfo, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-    VkImageCreateInfo imgInfo = {.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                                 .pNext         = &external,
-                                 .imageType     = VK_IMAGE_TYPE_2D,
-                                 .format        = SRCFMT,
-                                 .extent        = {(uint32_t)SRCDMA.size.x, (uint32_t)SRCDMA.size.y, 1},
-                                 .mipLevels     = 1,
-                                 .arrayLayers   = 1,
-                                 .samples       = VK_SAMPLE_COUNT_1_BIT,
-                                 .tiling        = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-                                 .usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                 .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
-                                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VkImage           image   = VK_NULL_HANDLE;
-    if (vkCreateImage(m_impl->device, &imgInfo, nullptr, &image) != VK_SUCCESS)
-        return false;
-
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(m_impl->device, image, &req);
-    VkMemoryFdPropertiesKHR fdProps = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-    if (!m_impl->getMemoryFdProps || m_impl->getMemoryFdProps(m_impl->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, SRCDMA.fds[0], &fdProps) != VK_SUCCESS) {
-        vkDestroyImage(m_impl->device, image, nullptr);
-        return false;
-    }
-
-    VkPhysicalDeviceMemoryProperties mem;
-    vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &mem);
-    const uint32_t allowed = req.memoryTypeBits & fdProps.memoryTypeBits;
-    VkDeviceMemory srcMem  = VK_NULL_HANDLE;
-    for (uint32_t i = 0; i < mem.memoryTypeCount && !srcMem; ++i) {
-        if (!(allowed & (1u << i)))
-            continue;
-        const int IMPORTFD = dup(SRCDMA.fds[0]);
-        if (IMPORTFD < 0)
-            continue;
-        VkImportMemoryFdInfoKHR       import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = IMPORTFD};
-        VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &import, .image = image};
-        VkMemoryAllocateInfo          alloc     = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated, .allocationSize = req.size, .memoryTypeIndex = i};
-        if (vkAllocateMemory(m_impl->device, &alloc, nullptr, &srcMem) != VK_SUCCESS) {
-            close(IMPORTFD);
-            srcMem = VK_NULL_HANDLE;
-            continue;
-        }
-    }
-    if (!srcMem || vkBindImageMemory(m_impl->device, image, srcMem, 0) != VK_SUCCESS) {
-        if (srcMem)
-            vkFreeMemory(m_impl->device, srcMem, nullptr);
-        vkDestroyImage(m_impl->device, image, nullptr);
-        return false;
-    }
-
-    // Release the imported source on every exit path. The one exception is a
-    // fence timeout below: the GPU may still be reading it, freeing then would be
-    // a use-after-free, so those resources ride along until the device dies.
-    bool                     keepSource = false;
-    CScopeGuard              sourceGuard([&] {
-        if (keepSource)
-            return;
-        vkDestroyImage(m_impl->device, image, nullptr);
-        vkFreeMemory(m_impl->device, srcMem, nullptr);
-    });
-
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (vkResetCommandBuffer(SLOT.command, 0) != VK_SUCCESS || vkBeginCommandBuffer(SLOT.command, &begin) != VK_SUCCESS)
         return false;
 
+    // The cached image is owned by the foreign family between copies: each copy acquires it
+    // and the release below hands it back, since a repeated acquire without a release in
+    // between is not valid.
     VkImageMemoryBarrier acquire = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                     .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
                                     .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
                                     .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
                                     .dstQueueFamilyIndex = m_impl->queueFamily,
-                                    .image               = image,
+                                    .image               = SOURCE.image,
                                     .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(SLOT.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
 
@@ -580,7 +692,17 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
                                 .bufferImageHeight = (uint32_t)SRCDMA.size.y,
                                 .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageExtent       = {(uint32_t)SRCDMA.size.x, (uint32_t)SRCDMA.size.y, 1}};
-    vkCmdCopyImageToBuffer(SLOT.command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, 1, &region);
+    vkCmdCopyImageToBuffer(SLOT.command, SOURCE.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, 1, &region);
+
+    VkImageMemoryBarrier release = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                    .srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+                                    .oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    .srcQueueFamilyIndex = m_impl->queueFamily,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                                    .image               = SOURCE.image,
+                                    .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(SLOT.command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
     if (vkEndCommandBuffer(SLOT.command) != VK_SUCCESS)
         return false;
 
@@ -597,11 +719,10 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     if (vkResetFences(m_impl->device, 1, &SLOT.fence) != VK_SUCCESS || vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence) != VK_SUCCESS)
         return false;
 
-    // The copy is in flight, so the imported source now belongs to the slot: it is released
-    // when the slot is reused, after its fence has signalled. Nothing here waits on the host.
-    SLOT.srcImage  = image;
-    SLOT.srcMemory = srcMem;
-    keepSource     = true;
+    // The copy is in flight, so the import belongs to this slot until its fence signals.
+    SLOT.sourceId = SOURCE.id;
+    SOURCE.slotsUsing++;
+    SOURCE.lastUse = ++m_impl->useCounter;
 
     VkSemaphoreGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = SLOT.outgoing, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
     int                     fd   = -1;
@@ -616,7 +737,8 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
         ++m_impl->hostWaits;
     if (m_impl->copies % 300 == 0)
         log(AQ_LOG_DEBUG,
-            std::format("drm: MSC copy stats: {} copies, {} gpu waits, {} host waits, {} slot waits", m_impl->copies, m_impl->gpuWaits, m_impl->hostWaits, m_impl->slotWaits));
+            std::format("drm: MSC copy stats: {} copies, {} gpu waits, {} host waits, {} slot waits, {} source imports cached", m_impl->copies, m_impl->gpuWaits, m_impl->hostWaits,
+                        m_impl->slotWaits, m_impl->sources.size()));
 
     return true;
 }

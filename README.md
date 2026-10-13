@@ -52,7 +52,8 @@ Environment - all roles are explicit, there is no auto-detection and no fallback
 
 ```sh
 export AQ_MSC=1                        # 0|1 switch
-export AQ_MSC_ENGINE=vulkan            # copy engine
+export AQ_MSC_COPY=vulkan              # how the copy is performed (vulkan is the only one)
+export AQ_MSC_QUEUE=transfer           # transfer (async copy engine) | graphics
 export AQ_MSC_DISPLAY=/dev/dri/card1   # gpu display (display only)
 export AQ_MSC_COMPOSE=/dev/dri/card0   # gpu compose
 ```
@@ -69,6 +70,7 @@ the pointer is then composited into the frame.
 - the whole frame is copied per commit, so there are no partial (damage) copies;
 - a second output on the display GPU is untested;
 - HDR / 10-bit, scaled modes and multi-GPU output are untested;
-- there is no blit fallback: if the copy cannot be built the output stays dark and
-  the log says why;
+- there is no blit fallback and no queue fallback: if the copy cannot be built, or
+  `AQ_MSC_QUEUE=transfer` is asked for on a device without a transfer-only family,
+  the session refuses to start and the log says why;
 - Vulkan is linked unconditionally, so `libvulkan` is loaded even with `AQ_MSC` off.

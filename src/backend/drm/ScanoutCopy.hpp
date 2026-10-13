@@ -61,7 +61,8 @@ namespace Aquamarine {
 
     class CMSCTransfer {
       public:
-        static Hyprutils::Memory::CSharedPointer<CMSCTransfer> create(Hyprutils::Memory::CWeakPointer<CDRMBackend> primary, Hyprutils::Memory::CSharedPointer<CBackend> logBackend);
+        static Hyprutils::Memory::CSharedPointer<CMSCTransfer> create(Hyprutils::Memory::CWeakPointer<CDRMBackend> primary, Hyprutils::Memory::CSharedPointer<CBackend> logBackend,
+                                                                      bool useCopyEngine);
         ~CMSCTransfer();
 
         bool                                       good();
@@ -80,10 +81,15 @@ namespace Aquamarine {
       private:
         friend class CMSCBuffer;
 
-        CMSCTransfer(Hyprutils::Memory::CWeakPointer<CDRMBackend> primary, Hyprutils::Memory::CSharedPointer<CBackend> logBackend);
+        CMSCTransfer(Hyprutils::Memory::CWeakPointer<CDRMBackend> primary, Hyprutils::Memory::CSharedPointer<CBackend> logBackend, bool useCopyEngine);
 
         bool allocateDestinationStorage(VkDeviceSize bytes, SMSCBufferStorage& out);
         void freeDestinationStorage(SMSCBufferStorage& storage);
+
+        // One import per producer buffer, kept while the compositor still holds it: importing
+        // one costs a vkCreateImage plus a dedicated allocation of its dma-buf.
+        int  acquireSource(const Hyprutils::Memory::CSharedPointer<IBuffer>& src, const SDMABUFAttrs& attrs, VkFormat format);
+        void evictIdleSources();
 
         void log(eBackendLogLevel level, const std::string& msg);
 
