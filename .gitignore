@@ -35,6 +35,9 @@ build/
 .vscode/
 .cache/
 
+# Local scratch: notes, probes, build tree and run logs
+.local/
+
 protocols/*.cpp
 protocols/*.hpp
 

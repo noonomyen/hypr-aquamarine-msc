@@ -3,6 +3,7 @@
 #include <aquamarine/allocator/Allocator.hpp>
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/buffer/Buffer.hpp>
+#include <hyprutils/math/Region.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/memory/WeakPtr.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
@@ -71,9 +72,13 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<IBuffer> allocateDestination(uint32_t fourcc, const Hyprutils::Math::Vector2D& size);
 
         // Copy `src` into `dst` (a CMSCBuffer). When `waitFd` is >= 0 it is imported as a
-        // semaphore and waited on the GPU (with a host-wait fallback if the import fails),
-        // and `outFence` is set to the copy-completion sync file.
-        bool copy(Hyprutils::Memory::CSharedPointer<IBuffer> src, Hyprutils::Memory::CSharedPointer<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence);
+        // semaphore and waited on the GPU (with a host-wait fallback if the import fails), and
+        // `outFence` is set to the copy-completion sync file, or left invalid when the frame was
+        // skipped (the destination already held it). `damage` is the region that changed since the
+        // last frame, or null when the caller has nothing to trust, in which case every
+        // destination takes a whole frame.
+        bool copy(Hyprutils::Memory::CSharedPointer<IBuffer> src, Hyprutils::Memory::CSharedPointer<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence,
+                  const Hyprutils::Math::CRegion* damage = nullptr);
 
         Hyprutils::Memory::CWeakPointer<CDRMBackend>  primary();
 
@@ -91,6 +96,7 @@ namespace Aquamarine {
         // one costs a vkCreateImage plus a dedicated allocation of its dma-buf.
         int  acquireSource(const Hyprutils::Memory::CSharedPointer<IBuffer>& src, const SDMABUFAttrs& attrs, VkFormat format);
         void evictIdleSources();
+        void logStats();
 
         // Logs a failed Vulkan call and latches a lost device, which is the only failure the
         // backend can recover from by rebuilding the engine.
@@ -124,6 +130,18 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<CMSCTransfer> m_transfer;
         SDMABUFAttrs                                    m_attrs;
         SMSCBufferStorage                               m_storage;
+        // The damage this destination still owes: what a copy has to move the next time this
+        // buffer is written. It belongs to the buffer, because the ring is what makes a frame
+        // miss damage, and a buffer that has never been filled is not in sync with anything.
+        Hyprutils::Math::CRegion m_pendingDamage;
+        bool                     m_seeded = false;
+
+        Hyprutils::Math::CRegion pendingDamage();
+        bool                     seeded() const;
+        void                     markSynced();
+        // Every frame's damage goes to every destination in the rotating set, not only the one
+        // being written; each buffer forgets what it owes once it has been written again.
+        void accumulateDamage(const Hyprutils::Math::CRegion& region);
     };
 
     class CMSCAllocator : public IAllocator {

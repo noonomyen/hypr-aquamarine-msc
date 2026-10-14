@@ -127,7 +127,9 @@ void main() {
 static inline void loadGLProc(void* pProc, const char* name) {
     void* proc = (void*)eglGetProcAddress(name);
     if (!proc) {
-        gBackend->log(AQ_LOG_ERROR, std::format("eglGetProcAddress({}) failed, the display driver doesn't support it", name));
+        // The backend can be gone by the time this runs; do not dereference it blindly.
+        if (auto backend = gBackend.lock())
+            backend->log(AQ_LOG_ERROR, std::format("eglGetProcAddress({}) failed, the display driver doesn't support it", name));
         abort();
     }
     *(void**)pProc = proc;
@@ -166,7 +168,12 @@ static const char* eglErrorToString(EGLint error) {
 }
 
 static void eglLog(EGLenum error, const char* command, EGLint type, EGLLabelKHR thread, EGLLabelKHR obj, const char* msg) {
-    gBackend->log(eglLogToLevel(type), std::format("[EGL] Command {} errored out with {} (0x{}): {}", command, eglErrorToString(error), error, msg));
+    // The driver can call this during teardown with null strings and a dead backend; formatting a
+    // null C string faults, so bail out when either is unusable.
+    auto backend = gBackend.lock();
+    if (!backend)
+        return;
+    backend->log(eglLogToLevel(type), std::format("[EGL] Command {} errored out with {} (0x{}): {}", command ? command : "", eglErrorToString(error), error, msg ? msg : ""));
 }
 
 static bool drmDeviceHasName(const drmDevice* device, const std::string& name) {

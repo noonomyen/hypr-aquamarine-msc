@@ -2639,13 +2639,16 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
         mgpuAcquired = true;
 
         Hyprutils::OS::CFileDescriptor copyFence;
-        const int                      WAITFD = (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
-        if (!MSC->copy(STATE.buffer, NEW_BUFFER, WAITFD, copyFence)) {
+        const bool                     HAVE_DAMAGE = (STATE.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE) != 0;
+        const int                      WAITFD      = (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
+        if (!MSC->copy(STATE.buffer, NEW_BUFFER, WAITFD, copyFence, HAVE_DAMAGE ? &STATE.damage : nullptr)) {
             backend->log(AQ_LOG_ERROR, "drm: MSC async copy failed");
             return false;
         }
 
-        if (!copyFence.isValid() || !supportsExplicit || mscFencesDisabled()) {
+        // A missing fence means copy() skipped the frame (the destination already holds it), which
+        // needs no in-fence. Only a real copy on a CRTC without explicit sync has to wait.
+        if (copyFence.isValid() && (!supportsExplicit || mscFencesDisabled())) {
             requiresSync = true;
             return false;
         }
@@ -2917,8 +2920,9 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                 if (!NEWAQBUF)
                     return false;
 
-                const int WAITFD = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
-                if (!MSC->copy(STATE.buffer, NEWAQBUF, WAITFD, mscFence)) {
+                const bool HAVE_DAMAGE = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE) != 0;
+                const int  WAITFD      = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
+                if (!MSC->copy(STATE.buffer, NEWAQBUF, WAITFD, mscFence, HAVE_DAMAGE ? &STATE.damage : nullptr)) {
                     backend->backend->log(AQ_LOG_ERROR, "drm: MSC copy failed");
                     return false;
                 }

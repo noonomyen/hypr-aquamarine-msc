@@ -1,7 +1,9 @@
 #include "ScanoutCopy.hpp"
+#include "Shared.hpp"
 
 #include <aquamarine/backend/DRM.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -21,6 +23,50 @@ using namespace Hyprutils::Memory;
 #define WP CWeakPointer
 
 namespace {
+    enum class ECopyMode {
+        Full,
+        Partial,
+        Skip
+    };
+
+    // Beyond this many boxes, or this much of the frame, a full copy is both simpler and no
+    // slower, so the tracking gives up on that frame.
+    constexpr size_t MSC_DAMAGE_MAX_RECTS     = 16;
+    constexpr double MSC_DAMAGE_FULL_FRACTION = 0.5;
+
+    // AQ_MSC_DAMAGE=0 copies whole frames; on (the default) the copy follows the damage the
+    // compositor reports, skipping frames that changed nothing and moving only the boxes that did.
+    bool trackDamage = [] { return !envExplicitlyDisabled("AQ_MSC_DAMAGE"); }();
+
+    // The NVIDIA Vulkan ICD can dlclose its core library while the process tears down, so a Vulkan
+    // call from a destructor that runs after that (these objects are owned by Hyprland's global
+    // backend, which is constructed before this transfer and destroyed after it) faults on an
+    // unmapped address. Registering std::atexit here, at transfer creation, runs it before those
+    // globals: mark the exit and leak the Vulkan objects instead. The kernel reclaims them and the
+    // process is going away anyway.
+    // Deliberate simplification: the leak is exit-only; a deterministic backend teardown would
+    // remove the need for it.
+    std::atomic<bool> driverTearingDown = false;
+
+    void              noteDriverTearingDown() {
+        driverTearingDown = true;
+    }
+
+    uint64_t regionArea(const Hyprutils::Math::CRegion& region) {
+        uint64_t area = 0;
+        for (const auto& R : region.getRects())
+            area += (uint64_t)(R.x2 - R.x1) * (uint64_t)(R.y2 - R.y1);
+        return area;
+    }
+
+    size_t damageBucket(double fraction) {
+        static const double BOUNDS[] = {0.000001, 0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.000001};
+        for (size_t i = 0; i < std::size(BOUNDS); ++i)
+            if (fraction < BOUNDS[i])
+                return i;
+        return std::size(BOUNDS) - 1;
+    }
+
     // The NVIDIA Vulkan ICD opens an X display while it initialises and blocks
     // forever when that display accepts but never answers. Hyprland sets DISPLAY
     // for its Xwayland early in initServer, and the first commit can land before
@@ -111,6 +157,23 @@ SMSCBufferStorage& CMSCBuffer::storage() {
     return m_storage;
 }
 
+Hyprutils::Math::CRegion CMSCBuffer::pendingDamage() {
+    return m_pendingDamage;
+}
+
+bool CMSCBuffer::seeded() const {
+    return m_seeded;
+}
+
+void CMSCBuffer::markSynced() {
+    m_pendingDamage.clear();
+    m_seeded = true;
+}
+
+void CMSCBuffer::accumulateDamage(const Hyprutils::Math::CRegion& region) {
+    m_pendingDamage.add(region);
+}
+
 //
 struct CMSCTransfer::SImpl {
     VkInstance                     instance         = VK_NULL_HANDLE;
@@ -167,11 +230,20 @@ struct CMSCTransfer::SImpl {
         // id, not an index: evicting an entry shifts the ones behind it.
         uint64_t sourceId = 0;
     };
-    std::vector<SSource> sources;
-    uint64_t             sourceCounter = 0, useCounter = 0;
-    SSlot                slots[3];
-    size_t               nextSlot = 0;
-    uint64_t             copies = 0, gpuWaits = 0, hostWaits = 0, slotWaits = 0;
+    // Every destination the frame copy has written, so each frame's damage can be handed to all of
+    // them. Weak: a swapchain that is reallocated simply drops out.
+    std::vector<WP<IBuffer>> frameDestinations;
+    std::vector<SSource>     sources;
+    uint64_t                 sourceCounter = 0, useCounter = 0;
+    SSlot                    slots[3];
+    size_t                   nextSlot = 0;
+    uint64_t                 copies = 0, gpuWaits = 0, hostWaits = 0, slotWaits = 0;
+
+    // What the damage tracking did, and how much of each frame it moved. The distribution of that
+    // fraction is the number that decides whether the bookkeeping pays for itself.
+    uint64_t damageFull = 0, damagePartial = 0, damageSkipped = 0;
+    uint64_t damageRects = 0, damagePixels = 0, damageFramePixels = 0;
+    uint64_t damageBuckets[8] = {};
     // More than three copies can never be in flight, so a cache of this size always has an
     // evictable entry.
     static constexpr size_t MAXSOURCES = 16;
@@ -192,6 +264,13 @@ SP<CMSCTransfer> CMSCTransfer::create(WP<CDRMBackend> primary, SP<CBackend> logB
 CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, bool useCopyEngine) : m_primary(primary), m_backend(logBackend) {
     m_impl                = std::make_unique<SImpl>();
     m_impl->useCopyEngine = useCopyEngine;
+
+    // Armed once, at creation, so it pops before the globals that own this transfer during exit.
+    static const bool ATEXIT_ARMED = [] {
+        std::atexit(noteDriverTearingDown);
+        return true;
+    }();
+    (void)ATEXIT_ARMED;
 
     if (getenv("DISPLAY") != nullptr)
         log(AQ_LOG_DEBUG, "drm: MSC: hiding DISPLAY while the copy engine initialises (the NVIDIA ICD opens X during init)");
@@ -306,6 +385,8 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     if (!found)
         return;
 
+    log(AQ_LOG_DEBUG, std::format("drm: MSC: damage tracking {}", trackDamage ? "on" : "off (AQ_MSC_DAMAGE=0)"));
+
     // A transfer-only family executes transfer commands only: the copy and its barriers are
     // transfer commands, but vkCmdClearColorImage is not, and it loses the device there.
     log(AQ_LOG_DEBUG, std::format("drm: MSC: copy queue family {} ({})", m_impl->queueFamily, m_impl->useCopyEngine ? "transfer-only, the async copy engine" : "graphics"));
@@ -361,7 +442,9 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
 CMSCTransfer::~CMSCTransfer() {
     if (!m_impl)
         return;
-    if (m_impl->device) {
+    // Once the process is exiting the driver may already be unloading; skip the Vulkan teardown
+    // and leak, rather than jump into an unloaded ICD.
+    if (m_impl->device && !driverTearingDown) {
         // The rebuild path can drop this transfer while a copy is still in flight, so make sure
         // the device is idle before its objects go (a lost device returns at once).
         vkDeviceWaitIdle(m_impl->device);
@@ -381,7 +464,7 @@ CMSCTransfer::~CMSCTransfer() {
             vkDestroyCommandPool(m_impl->device, m_impl->commandPool, nullptr);
         vkDestroyDevice(m_impl->device, nullptr);
     }
-    if (m_impl->instance)
+    if (m_impl->instance && !driverTearingDown)
         vkDestroyInstance(m_impl->instance, nullptr);
 }
 
@@ -461,7 +544,9 @@ bool CMSCTransfer::allocateDestinationStorage(VkDeviceSize bytes, SMSCBufferStor
 void CMSCTransfer::freeDestinationStorage(SMSCBufferStorage& s) {
     if (s.fd >= 0)
         close(s.fd);
-    if (s.device) {
+    // Same as the destructor: after the exit handler ran, the ICD may be unloaded, so leak the
+    // Vulkan objects rather than fault on an unmapped dispatch target.
+    if (s.device && !driverTearingDown) {
         if (s.buffer)
             vkDestroyBuffer(s.device, s.buffer, nullptr);
         if (s.memory)
@@ -617,7 +702,7 @@ uint64_t CMSCTransfer::copyCount() const {
     return m_impl ? m_impl->copies : 0;
 }
 
-bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence) {
+bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils::OS::CFileDescriptor& outFence, const Hyprutils::Math::CRegion* damage) {
     if (!good() || !src || !dst)
         return false;
 
@@ -633,7 +718,94 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     if (SRCFMT == VK_FORMAT_UNDEFINED)
         return false;
 
+    const uint32_t WIDTH  = (uint32_t)SRCDMA.size.x;
+    const uint32_t HEIGHT = (uint32_t)SRCDMA.size.y;
+    // The copy converts strides, so only the pixels have to line up for the damage rects to mean
+    // the same thing on both sides.
+    const bool SAMESIZE = WIDTH == (uint32_t)mscDst->size.x && HEIGHT == (uint32_t)mscDst->size.y;
+
+    // The damage bookkeeping below and the Vulkan recording further down both touch the transfer's
+    // shared state, so take the copy lock before either.
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+
+    // This frame's damage, or the whole frame when the compositor reported none: with no damage to
+    // trust, every destination takes the full frame next time so nothing it changed is missed.
+    Hyprutils::Math::CRegion tracked;
+    if (SAMESIZE) {
+        if (damage) {
+            tracked.set(*damage);
+            tracked.intersect(0, 0, (double)WIDTH, (double)HEIGHT);
+        } else
+            tracked.set(Hyprutils::Math::CRegion(0, 0, (double)WIDTH, (double)HEIGHT));
+    }
+
+    // The destination is one of a rotating set and every buffer in it has to catch up on the frames
+    // it sat out, so this frame's damage is added to all of them; each forgets it once written.
+    // Only destinations of this frame's size consume it: the cursor destination and any other
+    // resolution would otherwise accumulate damage they never clear.
+    if (trackDamage && SAMESIZE) {
+        bool known = false;
+        for (auto it = m_impl->frameDestinations.begin(); it != m_impl->frameDestinations.end();) {
+            if (it->expired()) {
+                it = m_impl->frameDestinations.erase(it);
+                continue;
+            }
+            if (it->lock().get() == dst.get())
+                known = true;
+            ++it;
+        }
+        if (!known)
+            m_impl->frameDestinations.emplace_back(dst);
+
+        const Hyprutils::Math::Vector2D FRAMESIZE{(double)WIDTH, (double)HEIGHT};
+        for (auto& DEST : m_impl->frameDestinations)
+            if (auto BUF = DEST.lock(); BUF && BUF->size == FRAMESIZE)
+                static_cast<CMSCBuffer*>(BUF.get())->accumulateDamage(tracked);
+    }
+
+    Hyprutils::Math::CRegion pending = mscDst->pendingDamage();
+    // The owed set is shared by every output; keep only what belongs to this frame, so a box can
+    // never describe another output (or the cursor) and run past the destination buffer.
+    pending.intersect(0, 0, (double)WIDTH, (double)HEIGHT);
+
+    ECopyMode mode;
+    if (!trackDamage || !SAMESIZE || !mscDst->seeded() || !damage)
+        mode = ECopyMode::Full;
+    else if (pending.empty())
+        mode = ECopyMode::Skip;
+    else if (pending.getRects().size() > MSC_DAMAGE_MAX_RECTS || (double)regionArea(pending) > MSC_DAMAGE_FULL_FRACTION * (double)WIDTH * (double)HEIGHT)
+        mode = ECopyMode::Full; // past the point where the bookkeeping pays for itself
+    else
+        mode = ECopyMode::Partial;
+
+    const std::vector<pixman_box32_t> BOXES = mode == ECopyMode::Partial ? pending.getRects() : std::vector<pixman_box32_t>{};
+
+    const uint64_t                    FRAMEPIXELS = (uint64_t)WIDTH * (uint64_t)HEIGHT;
+    const auto                        ACCOUNT     = [&](ECopyMode taken, size_t rects) {
+        const uint64_t MOVED = taken == ECopyMode::Full ? FRAMEPIXELS : regionArea(pending);
+        m_impl->damageFramePixels += FRAMEPIXELS;
+        m_impl->damagePixels += MOVED;
+        m_impl->damageRects += rects;
+
+        if (taken == ECopyMode::Full)
+            m_impl->damageFull++;
+        else if (taken == ECopyMode::Partial)
+            m_impl->damagePartial++;
+        else
+            m_impl->damageSkipped++;
+
+        m_impl->damageBuckets[damageBucket(FRAMEPIXELS ? (double)MOVED / (double)FRAMEPIXELS : 0.0)]++;
+        if ((m_impl->damageFull + m_impl->damagePartial + m_impl->damageSkipped) % 300 == 0)
+            logStats();
+    };
+
+    if (mode == ECopyMode::Skip) {
+        // Nothing changed, so the destination already holds this frame. There is no copy and no
+        // fence: the caller has nothing to wait for.
+        ACCOUNT(mode, 0);
+        mscDst->markSynced();
+        return true;
+    }
 
     // Reuse the oldest slot: three copies of pipeline depth. The KMS in-fence retires the
     // flip behind its copy, so the slot is normally signalled by the time it comes around,
@@ -725,12 +897,28 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
                                     .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(SLOT.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
 
-    VkBufferImageCopy region = {.bufferOffset      = 0,
-                                .bufferRowLength   = mscDst->storage().stride / 4,
-                                .bufferImageHeight = (uint32_t)SRCDMA.size.y,
-                                .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                .imageExtent       = {(uint32_t)SRCDMA.size.x, (uint32_t)SRCDMA.size.y, 1}};
-    vkCmdCopyImageToBuffer(SLOT.command, SOURCE.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, 1, &region);
+    std::vector<VkBufferImageCopy> regions;
+    if (mode == ECopyMode::Full) {
+        regions.push_back({.bufferOffset      = 0,
+                           .bufferRowLength   = mscDst->storage().stride / 4,
+                           .bufferImageHeight = HEIGHT,
+                           .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageExtent       = {WIDTH, HEIGHT, 1}});
+    } else {
+        regions.reserve(BOXES.size());
+        for (const auto& BOX : BOXES) {
+            // Both offsets are needed: imageOffset selects the box in the source frame and
+            // bufferOffset places it at the same coordinates in the destination buffer. Without
+            // imageOffset every box is fed the frame's top-left corner.
+            regions.push_back({.bufferOffset      = (VkDeviceSize)BOX.y1 * mscDst->storage().stride + (VkDeviceSize)BOX.x1 * 4,
+                               .bufferRowLength   = mscDst->storage().stride / 4,
+                               .bufferImageHeight = HEIGHT,
+                               .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                               .imageOffset       = {(int32_t)BOX.x1, (int32_t)BOX.y1, 0},
+                               .imageExtent       = {(uint32_t)(BOX.x2 - BOX.x1), (uint32_t)(BOX.y2 - BOX.y1), 1}});
+        }
+    }
+    vkCmdCopyImageToBuffer(SLOT.command, SOURCE.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, (uint32_t)regions.size(), regions.data());
 
     VkImageMemoryBarrier release = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                     .srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
@@ -757,17 +945,16 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     VkResult             submitResult = vkResetFences(m_impl->device, 1, &SLOT.fence);
     if (submitResult == VK_SUCCESS)
         submitResult = vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence);
-    if (submitResult != VK_SUCCESS) {
-        log(AQ_LOG_ERROR, std::format("drm: MSC: submitting the copy failed (VkResult {})", (int)submitResult));
-        if (submitResult == VK_ERROR_DEVICE_LOST)
-            m_bad = true; // the device went with the submit; the backend rebuilds the engine
+    if (!checkResult(submitResult, "submitting the copy"))
         return false;
-    }
 
-    // The copy is in flight, so the import belongs to this slot until its fence signals.
+    // The copy is in flight, so the import belongs to this slot until its fence signals. markSynced
+    // records the destination as holding this frame at submit; the KMS in-fence, not the
+    // bookkeeping, is what keeps scanout behind the write.
     SLOT.sourceId = SOURCE.id;
     SOURCE.slotsUsing++;
     SOURCE.lastUse = ++m_impl->useCounter;
+    mscDst->markSynced();
 
     VkSemaphoreGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = SLOT.outgoing, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
     int                     fd   = -1;
@@ -780,12 +967,24 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
         ++m_impl->gpuWaits;
     else
         ++m_impl->hostWaits;
-    if (m_impl->copies % 300 == 0)
-        log(AQ_LOG_DEBUG,
-            std::format("drm: MSC copy stats: {} copies, {} gpu waits, {} host waits, {} slot waits, {} source imports cached", m_impl->copies, m_impl->gpuWaits, m_impl->hostWaits,
-                        m_impl->slotWaits, m_impl->sources.size()));
+
+    ACCOUNT(mode, BOXES.size());
 
     return true;
+}
+
+void CMSCTransfer::logStats() {
+    const uint64_t FRAMES = m_impl->damageFull + m_impl->damagePartial + m_impl->damageSkipped;
+    const double   MEAN   = m_impl->damageFramePixels ? (double)m_impl->damagePixels / (double)m_impl->damageFramePixels * 100.0 : 0.0;
+
+    log(AQ_LOG_DEBUG,
+        std::format("drm: MSC copy stats: {} copies, {} gpu waits, {} host waits, {} slot waits, {} source imports cached", m_impl->copies, m_impl->gpuWaits, m_impl->hostWaits,
+                    m_impl->slotWaits, m_impl->sources.size()));
+    log(AQ_LOG_DEBUG,
+        std::format("drm: MSC damage over {} frames: partial {} full {} skipped {}, mean {:.2f}% of the frame moved, {} damage rects, buckets 0:{} 1%:{} 2%:{} 5%:{} 10%:{} 25%:{} "
+                    "50%:{} 100%:{}",
+                    FRAMES, m_impl->damagePartial, m_impl->damageFull, m_impl->damageSkipped, MEAN, m_impl->damageRects, m_impl->damageBuckets[0], m_impl->damageBuckets[1],
+                    m_impl->damageBuckets[2], m_impl->damageBuckets[3], m_impl->damageBuckets[4], m_impl->damageBuckets[5], m_impl->damageBuckets[6], m_impl->damageBuckets[7]));
 }
 
 void CMSCTransfer::log(eBackendLogLevel level, const std::string& msg) {
