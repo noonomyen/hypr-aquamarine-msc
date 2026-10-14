@@ -3,7 +3,8 @@
 A patched Aquamarine for **muxless laptops**, where the dGPU is the only usable
 renderer and the iGPU is the only path to the panel: the dGPU composes, the iGPU
 only scans out. Base: upstream `v0.15.1` - the unmodified readme is
-[README.aquamarine.md](README.aquamarine.md).
+[README.aquamarine.md](README.aquamarine.md). A one-page summary of what the patch changes
+is in [PATCHES.md](PATCHES.md).
 
 ## What this is
 
@@ -23,7 +24,7 @@ flowchart LR
 ```
 
 The usual route - having the iGPU copy the finished frame - does not work on this
-hardware: no buffer format suits both GPUs, so it falls back to a slow round trip through
+hardware: no format modifier suits both GPUs, so it falls back to a slow round trip through
 the CPU. This patch copies the frame on the dGPU instead, into a buffer the iGPU can
 display directly, and the iGPU only ever scans it out.
 
