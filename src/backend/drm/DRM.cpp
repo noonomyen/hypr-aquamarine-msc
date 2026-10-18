@@ -224,6 +224,9 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
     //                           engine, so it does not compete with rendering) or graphics
     //   AQ_MSC_DISPLAY=<path>   gpu display (display only)
     //   AQ_MSC_COMPOSE=<path>   gpu compose
+    //   AQ_MSC_DAMAGE=<0|1>      follow the compositor's damage (default) or copy whole frames
+    //   AQ_MSC_STATS=<seconds>   how often the copy counters are logged (default 60, 0 disables)
+    //   AQ_MSC_NO_FENCE=<0|1>    debug: commit without handing the copy fence to KMS
     // Everything here is skipped when AQ_MSC is not enabled, so the unpatched
     // device selection (AQ_DRM_DEVICES / auto) is untouched.
     const char* mscEnable     = getenv("AQ_MSC");
@@ -2930,10 +2933,12 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                     return false;
                 }
 
-                static bool loggedDst = false;
-                if (!loggedDst) {
-                    loggedDst      = true;
-                    const auto DST = NEWAQBUF->dmabuf();
+                const auto DST = NEWAQBUF->dmabuf();
+                if (!mgpu.loggedDstFB || mgpu.loggedDstFormat != DST.format || mgpu.loggedDstModifier != DST.modifier || mgpu.loggedDstSize != DST.size) {
+                    mgpu.loggedDstFB       = true;
+                    mgpu.loggedDstFormat   = DST.format;
+                    mgpu.loggedDstModifier = DST.modifier;
+                    mgpu.loggedDstSize     = DST.size;
                     backend->backend->log(AQ_LOG_DEBUG,
                                           std::format("drm: MSC dst fb fourcc {:#x} modifier {:#x} {}x{} planes {} stride[0] {} offset[0] {}", DST.format, DST.modifier,
                                                       (int)DST.size.x, (int)DST.size.y, DST.planes, DST.strides[0], DST.offsets[0]));

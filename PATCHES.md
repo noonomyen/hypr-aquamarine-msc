@@ -204,10 +204,15 @@ Per copy, the owed set is clipped to the frame and decides the mode:
   coordinates in the destination, `bufferRowLength` is the destination row length in pixels,
   the stride / 4);
 - **full** - the whole frame, used when the tracking cannot be trusted: a destination that
-  has never been filled, a frame with no reported damage, more than 16 boxes, or more than
-  half the frame changed.
+  has never been filled, a frame with no reported damage, more than 16 boxes, or nearly the
+  whole frame (90%) changed. A partial copy is one box per rect and a box's rows are
+  contiguous, so copying 90% as boxes costs about what a whole frame costs.
 
 `AQ_MSC_DAMAGE=0` turns the whole thing off and copies whole frames.
+
+The engine also reports its counters (copies, waits, the damage distribution, and why frames were
+copied whole) once every 60 s; `AQ_MSC_STATS=<seconds>` changes the interval and `AQ_MSC_STATS=0`
+turns the reports off.
 
 ### The display side, failure, and teardown
 

@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <iterator>
 #include <string_view>
@@ -30,14 +31,26 @@ namespace {
         Skip
     };
 
-    // Beyond this many boxes, or this much of the frame, a full copy is both simpler and no
-    // slower, so the tracking gives up on that frame.
+    // Beyond this many boxes, or this much of the frame, a full copy is both simpler and no slower:
+    // a partial copy is one box per damage rect and a box's rows are contiguous, so a nearly
+    // whole-frame box costs about what a whole frame costs.
     constexpr size_t MSC_DAMAGE_MAX_RECTS     = 16;
-    constexpr double MSC_DAMAGE_FULL_FRACTION = 0.5;
+    constexpr double MSC_DAMAGE_FULL_FRACTION = 0.9;
 
     // AQ_MSC_DAMAGE=0 copies whole frames; on (the default) the copy follows the damage the
     // compositor reports, skipping frames that changed nothing and moving only the boxes that did.
     bool trackDamage = [] { return !envExplicitlyDisabled("AQ_MSC_DAMAGE"); }();
+
+    // How often the copy counters are logged: AQ_MSC_STATS=<seconds>, default 60. An unset value
+    // means the default; zero, a negative number or an unparsable one turns them off.
+    int statsSeconds() {
+        const char* value = getenv("AQ_MSC_STATS");
+        if (!value)
+            return 60;
+        const int seconds = atoi(value);
+        return seconds > 0 ? seconds : 0;
+    }
+    const int MSC_STATS_SECONDS = statsSeconds();
 
     // The NVIDIA Vulkan ICD can dlclose its core library while the process tears down, so a Vulkan
     // call from a destructor that runs after that (these objects are owned by Hyprland's global
@@ -240,6 +253,11 @@ struct CMSCTransfer::SImpl {
     uint64_t damageFull = 0, damagePartial = 0, damageSkipped = 0;
     uint64_t damageRects = 0, damagePixels = 0, damageFramePixels = 0;
     uint64_t damageBuckets[8] = {};
+    // Why a frame was copied whole, and what the tracking asked for on the frames it could be used
+    // on: the partial/full counts alone cannot say which of the two decides a frame.
+    uint64_t damageFullNoTracking = 0, damageFullSizeMismatch = 0, damageFullUnseeded = 0, damageFullNoDamage = 0, damageFullManyRects = 0, damageFullMuchArea = 0;
+    uint64_t damageTrackedFrames = 0, damageOwedPixels = 0, damageTrackedMovedPixels = 0, damageTrackedFramePixels = 0;
+    std::chrono::steady_clock::time_point lastStats{}, started{};
     // More than three copies can never be in flight, so a cache of this size always has an
     // evictable entry.
     static constexpr size_t MAXSOURCES = 16;
@@ -260,6 +278,7 @@ SP<CMSCTransfer> CMSCTransfer::create(WP<CDRMBackend> primary, SP<CBackend> logB
 CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, bool useCopyEngine) : m_primary(primary), m_backend(logBackend) {
     m_impl                = std::make_unique<SImpl>();
     m_impl->useCopyEngine = useCopyEngine;
+    m_impl->started = m_impl->lastStats = std::chrono::steady_clock::now();
 
     // Armed once, at creation, so it pops before the globals that own this transfer during exit.
     static const bool ATEXIT_ARMED = [] {
@@ -783,33 +802,86 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     for (int i = 0; i < damageRectCount; ++i)
         damageArea += (uint64_t)(DAMAGE[i].x2 - DAMAGE[i].x1) * (uint64_t)(DAMAGE[i].y2 - DAMAGE[i].y1);
 
-    ECopyMode mode;
-    if (!trackDamage || !SAMESIZE || !mscDst->seeded() || !damage)
-        mode = ECopyMode::Full;
-    else if (pending.empty())
-        mode = ECopyMode::Skip;
-    else if (damageRectCount > (int)MSC_DAMAGE_MAX_RECTS || (double)damageArea > MSC_DAMAGE_FULL_FRACTION * (double)WIDTH * (double)HEIGHT)
-        mode = ECopyMode::Full; // past the point where the bookkeeping pays for itself
-    else
-        mode = ECopyMode::Partial;
+    // Which of the untrusted cases forced a whole-frame copy.
+    enum class EFullReason : uint8_t {
+        None,
+        NoTracking,
+        SizeMismatch,
+        Unseeded,
+        NoDamage,
+        ManyRects,
+        MuchArea
+    };
+    EFullReason    fullReason = EFullReason::None;
 
     const uint64_t FRAMEPIXELS = (uint64_t)WIDTH * (uint64_t)HEIGHT;
-    const auto     ACCOUNT     = [&](ECopyMode taken, size_t rects) {
+
+    // The frames the tracking could be used on at all: the fallback rules do not apply to them. For
+    // those, record what the owed set asked for and what was copied, so the two can be compared.
+    const bool TRACKED = trackDamage && SAMESIZE && mscDst->seeded() && damage != nullptr;
+    if (TRACKED) {
+        m_impl->damageTrackedFrames++;
+        m_impl->damageOwedPixels += damageArea;
+        m_impl->damageTrackedFramePixels += FRAMEPIXELS;
+    }
+
+    ECopyMode mode;
+    if (!trackDamage) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::NoTracking;
+    } else if (!SAMESIZE) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::SizeMismatch;
+    } else if (!mscDst->seeded()) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::Unseeded;
+    } else if (!damage) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::NoDamage;
+    } else if (pending.empty())
+        mode = ECopyMode::Skip;
+    else if (damageRectCount > (int)MSC_DAMAGE_MAX_RECTS) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::ManyRects;
+    } else if ((double)damageArea > MSC_DAMAGE_FULL_FRACTION * (double)WIDTH * (double)HEIGHT) {
+        mode       = ECopyMode::Full;
+        fullReason = EFullReason::MuchArea;
+    } else
+        mode = ECopyMode::Partial;
+
+    const auto ACCOUNT = [&](ECopyMode taken, size_t rects) {
         const uint64_t MOVED = taken == ECopyMode::Full ? FRAMEPIXELS : damageArea;
         m_impl->damageFramePixels += FRAMEPIXELS;
         m_impl->damagePixels += MOVED;
         m_impl->damageRects += rects;
+        if (TRACKED)
+            m_impl->damageTrackedMovedPixels += MOVED;
 
-        if (taken == ECopyMode::Full)
+        if (taken == ECopyMode::Full) {
             m_impl->damageFull++;
-        else if (taken == ECopyMode::Partial)
+            switch (fullReason) {
+                case EFullReason::NoTracking: m_impl->damageFullNoTracking++; break;
+                case EFullReason::SizeMismatch: m_impl->damageFullSizeMismatch++; break;
+                case EFullReason::Unseeded: m_impl->damageFullUnseeded++; break;
+                case EFullReason::NoDamage: m_impl->damageFullNoDamage++; break;
+                case EFullReason::ManyRects: m_impl->damageFullManyRects++; break;
+                case EFullReason::MuchArea: m_impl->damageFullMuchArea++; break;
+                case EFullReason::None: break;
+            }
+        } else if (taken == ECopyMode::Partial)
             m_impl->damagePartial++;
         else
             m_impl->damageSkipped++;
 
         m_impl->damageBuckets[damageBucket(FRAMEPIXELS ? (double)MOVED / (double)FRAMEPIXELS : 0.0)]++;
-        if ((m_impl->damageFull + m_impl->damagePartial + m_impl->damageSkipped) % 300 == 0)
-            logStats();
+
+        if (MSC_STATS_SECONDS > 0) {
+            const auto NOW = std::chrono::steady_clock::now();
+            if (NOW - m_impl->lastStats >= std::chrono::seconds(MSC_STATS_SECONDS)) {
+                m_impl->lastStats = NOW;
+                logStats();
+            }
+        }
     };
 
     if (mode == ECopyMode::Skip) {
@@ -1010,17 +1082,29 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
 }
 
 void CMSCTransfer::logStats() {
-    const uint64_t FRAMES = m_impl->damageFull + m_impl->damagePartial + m_impl->damageSkipped;
-    const double   MEAN   = m_impl->damageFramePixels ? (double)m_impl->damagePixels / (double)m_impl->damageFramePixels * 100.0 : 0.0;
+    const uint64_t  FRAMES = m_impl->damageFull + m_impl->damagePartial + m_impl->damageSkipped;
+    const double    MEAN   = m_impl->damageFramePixels ? (double)m_impl->damagePixels / (double)m_impl->damageFramePixels * 100.0 : 0.0;
+    const long long AGE    = (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - m_impl->started).count();
 
     log(AQ_LOG_DEBUG,
-        std::format("drm: MSC copy stats: {} copies, {} gpu waits, {} host waits, {} slot waits, {} source imports cached", m_impl->copies, m_impl->gpuWaits, m_impl->hostWaits,
-                    m_impl->slotWaits, m_impl->sources.size()));
+        std::format("drm: MSC copy stats (t+{}s): {} copies, {} gpu waits, {} host waits, {} slot waits, {} source imports cached", AGE, m_impl->copies, m_impl->gpuWaits,
+                    m_impl->hostWaits, m_impl->slotWaits, m_impl->sources.size()));
     log(AQ_LOG_DEBUG,
-        std::format("drm: MSC damage over {} frames: partial {} full {} skipped {}, mean {:.2f}% of the frame moved, {} damage rects, buckets 0:{} 1%:{} 2%:{} 5%:{} 10%:{} 25%:{} "
-                    "50%:{} 100%:{}",
-                    FRAMES, m_impl->damagePartial, m_impl->damageFull, m_impl->damageSkipped, MEAN, m_impl->damageRects, m_impl->damageBuckets[0], m_impl->damageBuckets[1],
+        std::format("drm: MSC damage over {} frames (t+{}s): partial {} full {} skipped {}, mean {:.2f}% of the frame moved, {} damage rects, buckets 0:{} <1%:{} <2%:{} <5%:{} "
+                    "<10%:{} <25%:{} "
+                    "<50%:{} >=50%:{}",
+                    FRAMES, AGE, m_impl->damagePartial, m_impl->damageFull, m_impl->damageSkipped, MEAN, m_impl->damageRects, m_impl->damageBuckets[0], m_impl->damageBuckets[1],
                     m_impl->damageBuckets[2], m_impl->damageBuckets[3], m_impl->damageBuckets[4], m_impl->damageBuckets[5], m_impl->damageBuckets[6], m_impl->damageBuckets[7]));
+    // Both means are over the same frames - the ones the tracking could be used on - so the gap
+    // between them is exactly what the whole-frame fallbacks cost. The first line reports the
+    // fraction of every frame the copy actually moved, whatever mode it took.
+    const double OWED  = m_impl->damageTrackedFramePixels ? (double)m_impl->damageOwedPixels / (double)m_impl->damageTrackedFramePixels * 100.0 : 0.0;
+    const double MOVED = m_impl->damageTrackedFramePixels ? (double)m_impl->damageTrackedMovedPixels / (double)m_impl->damageTrackedFramePixels * 100.0 : 0.0;
+    log(AQ_LOG_DEBUG,
+        std::format("drm: MSC damage full reasons: no tracking {}, size mismatch {}, unseeded {}, no reported damage {}, over {} rects {}, over {:.0f}% of the frame {}; "
+                    "owed {:.2f}% vs moved {:.2f}% over {} tracked frames",
+                    m_impl->damageFullNoTracking, m_impl->damageFullSizeMismatch, m_impl->damageFullUnseeded, m_impl->damageFullNoDamage, MSC_DAMAGE_MAX_RECTS,
+                    m_impl->damageFullManyRects, MSC_DAMAGE_FULL_FRACTION * 100.0, m_impl->damageFullMuchArea, OWED, MOVED, m_impl->damageTrackedFrames));
 }
 
 void CMSCTransfer::log(eBackendLogLevel level, const std::string& msg) {

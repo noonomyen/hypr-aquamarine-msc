@@ -284,6 +284,12 @@ namespace Aquamarine {
         struct {
             Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain;
             Hyprutils::Memory::CSharedPointer<CSwapchain> cursorSwapchain;
+            // Last destination shape logged for this output: once per output and shape, so a format
+            // or mode change is visible without a line per frame.
+            bool                      loggedDstFB       = false;
+            uint32_t                  loggedDstFormat   = 0;
+            uint64_t                  loggedDstModifier = 0;
+            Hyprutils::Math::Vector2D loggedDstSize;
         } mgpu;
 
         bool                                                               lastCommitNoBuffer = true;

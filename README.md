@@ -49,19 +49,51 @@ directory is enough. For a uwsm session, in `~/.config/uwsm/env`:
 export LD_LIBRARY_PATH="$HOME/path/to/aquamarine-msc/build"
 ```
 
-Environment - all roles are explicit, there is no auto-detection and no fallback:
+Environment. `AQ_MSC` is the switch: with it unset (or `0`) nothing below takes effect and the
+library is stock Aquamarine. With `AQ_MSC=1` every choice is explicit - there is no
+auto-detection, and an invalid value for one of the required variables refuses to start and says so
+in the log:
+
+| Variable | Required | Values | Meaning |
+| --- | --- | --- | --- |
+| `AQ_MSC` | to enable | `1` | enable the scanout copy; `0`/unset is stock Aquamarine, anything else refuses |
+| `AQ_MSC_COPY` | yes | `vulkan` | how the copy is performed (`vulkan` is the only value) |
+| `AQ_MSC_QUEUE` | yes | `transfer` \| `graphics` | the queue family the copy is submitted to: `transfer` = the async copy engine (needs a transfer-only family on the compose GPU, and there is no fallback), `graphics` = the 3D engine |
+| `AQ_MSC_COMPOSE` | yes | a card node, e.g. `/dev/dri/card0` | the GPU that renders the frame and runs the copy |
+| `AQ_MSC_DISPLAY` | yes | a card node, e.g. `/dev/dri/card1` | the GPU that only scans out |
+| `AQ_MSC_DAMAGE` | no | `1` (default) \| `0` | follow the compositor's damage and copy only what changed; `0` copies whole frames. Anything but `0` counts as on. |
+| `AQ_MSC_STATS` | no | seconds (default `60`) \| `0` | how often the engine logs its counters (copies, waits, damage distribution, why frames were copied whole); `0` turns the reports off. A negative or unparsable value also turns them off, silently. |
+
+Debug only:
+
+| Variable | Value | Effect |
+| --- | --- | --- |
+| `AQ_MSC_NO_FENCE` | `1` | commit the destination without the copy's in-fence, to tell a bad framebuffer apart from a fence KMS refuses. The panel can then show a half-copied frame. |
+| `AQ_TRACE` | `1` | Aquamarine's per-frame trace logging (upstream), when the counters above are not enough |
 
 ```sh
-export AQ_MSC=1                        # 0|1 switch
-export AQ_MSC_COPY=vulkan              # how the copy is performed (vulkan is the only one)
-export AQ_MSC_QUEUE=transfer           # transfer (async copy engine) | graphics
-export AQ_MSC_DAMAGE=1                 # optional, default on: 0 copies whole frames
-export AQ_MSC_DISPLAY=/dev/dri/card1   # gpu display (display only)
-export AQ_MSC_COMPOSE=/dev/dri/card0   # gpu compose
+export AQ_MSC=1
+export AQ_MSC_COPY=vulkan
+export AQ_MSC_QUEUE=transfer
+export AQ_MSC_DISPLAY=/dev/dri/card1   # the display GPU
+export AQ_MSC_COMPOSE=/dev/dri/card0   # the compose GPU
 ```
 
 The GPU paths are whatever your dGPU and iGPU card nodes are; `by-path` links work
 too. An extra GPU is left unmanaged (the log says so).
+
+Clients should be pinned to the compose GPU too, or one of them picks the scanout GPU and its
+frames need exactly the cross-GPU path this patch exists to avoid:
+
+```sh
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export LIBVA_DRIVER_NAME=nvidia
+```
+
+(Those are the NVIDIA paths; use your compose GPU's ICD and vendor library. A `uwsm` session reads
+all of the above from `~/.config/uwsm/env`.)
 
 Compositor side: `cursor:no_hardware_cursors = 0` is required. Without it Hyprland
 chooses a software cursor on NVIDIA plus multi-GPU, which `AQ_MSC` makes true, and
