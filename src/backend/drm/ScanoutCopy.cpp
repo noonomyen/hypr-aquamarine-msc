@@ -3,9 +3,10 @@
 
 #include <aquamarine/backend/DRM.hpp>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <iterator>
 #include <string_view>
 #include <vector>
@@ -52,13 +53,6 @@ namespace {
         driverTearingDown = true;
     }
 
-    uint64_t regionArea(const Hyprutils::Math::CRegion& region) {
-        uint64_t area = 0;
-        for (const auto& R : region.getRects())
-            area += (uint64_t)(R.x2 - R.x1) * (uint64_t)(R.y2 - R.y1);
-        return area;
-    }
-
     size_t damageBucket(double fraction) {
         static const double BOUNDS[] = {0.000001, 0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.000001};
         for (size_t i = 0; i < std::size(BOUNDS); ++i)
@@ -100,7 +94,7 @@ CMSCBuffer::CMSCBuffer(SP<CMSCTransfer> transfer, unsigned width, unsigned heigh
     }
 
     m_storage.stride         = mscStrideFor(width);
-    const VkDeviceSize BYTES = (VkDeviceSize)m_storage.stride * height + 512;
+    const VkDeviceSize BYTES = (VkDeviceSize)m_storage.stride * height;
 
     if (!m_transfer->allocateDestinationStorage(BYTES, m_storage)) {
         m_attrs.success = false;
@@ -157,7 +151,7 @@ SMSCBufferStorage& CMSCBuffer::storage() {
     return m_storage;
 }
 
-Hyprutils::Math::CRegion CMSCBuffer::pendingDamage() {
+const Hyprutils::Math::CRegion& CMSCBuffer::pendingDamage() const {
     return m_pendingDamage;
 }
 
@@ -176,16 +170,18 @@ void CMSCBuffer::accumulateDamage(const Hyprutils::Math::CRegion& region) {
 
 //
 struct CMSCTransfer::SImpl {
-    VkInstance                     instance         = VK_NULL_HANDLE;
-    VkPhysicalDevice               physical         = VK_NULL_HANDLE;
-    VkDevice                       device           = VK_NULL_HANDLE;
-    VkQueue                        queue            = VK_NULL_HANDLE;
-    uint32_t                       queueFamily      = 0;
-    bool                           useCopyEngine    = true;
-    VkCommandPool                  commandPool      = VK_NULL_HANDLE;
-    PFN_vkImportSemaphoreFdKHR     importSemaphore  = nullptr;
-    PFN_vkGetSemaphoreFdKHR        getSemaphoreFd   = nullptr;
-    PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProps = nullptr;
+    VkInstance                       instance         = VK_NULL_HANDLE;
+    VkPhysicalDevice                 physical         = VK_NULL_HANDLE;
+    VkDevice                         device           = VK_NULL_HANDLE;
+    VkQueue                          queue            = VK_NULL_HANDLE;
+    uint32_t                         queueFamily      = 0;
+    bool                             useCopyEngine    = true;
+    VkCommandPool                    commandPool      = VK_NULL_HANDLE;
+    PFN_vkImportSemaphoreFdKHR       importSemaphore  = nullptr;
+    PFN_vkGetSemaphoreFdKHR          getSemaphoreFd   = nullptr;
+    PFN_vkGetMemoryFdPropertiesKHR   getMemoryFdProps = nullptr;
+    PFN_vkGetMemoryFdKHR             getMemoryFd      = nullptr;
+    VkPhysicalDeviceMemoryProperties memProps{};
 
     // One imported source per compositor buffer, kept between copies. src is the identity
     // of the producer's buffer, so an entry stays valid exactly as long as that buffer
@@ -289,9 +285,8 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     }
     const uint32_t TARGETMAJOR = major(st.st_rdev), TARGETMINOR = minor(st.st_rdev);
 
-    // Enable only the instance extensions the loader actually advertises:
-    // VK_EXT_physical_device_drm is promoted to core in Vulkan 1.4 and is then no
-    // longer listed, while requesting an absent extension fails the instance.
+    // Enable only the advertised instance extensions (an absent one fails the instance, and both
+    // of these are core in 1.1). VK_EXT_physical_device_drm is a device extension, queried below.
     uint32_t apiVersion = VK_API_VERSION_1_1;
     vkEnumerateInstanceVersion(&apiVersion);
     if (apiVersion < VK_API_VERSION_1_1)
@@ -302,7 +297,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     std::vector<VkExtensionProperties> available(extCount);
     vkEnumerateInstanceExtensionProperties(nullptr, &extCount, available.data());
 
-    const char*              wanted[] = {"VK_KHR_external_memory_capabilities", "VK_KHR_external_semaphore_capabilities", "VK_EXT_physical_device_drm"};
+    const char*              wanted[] = {"VK_KHR_external_memory_capabilities", "VK_KHR_external_semaphore_capabilities"};
     std::vector<const char*> enabled;
     for (const auto* W : wanted) {
         const bool HAS = std::ranges::any_of(available, [W](const auto& e) { return std::string_view{e.extensionName} == W; });
@@ -321,8 +316,16 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     }
 
     VkPhysicalDevice devices[16];
-    uint32_t         count = 16;
-    vkEnumeratePhysicalDevices(m_impl->instance, &count, devices);
+    uint32_t         count      = (uint32_t)std::size(devices);
+    const VkResult   ENUMRESULT = vkEnumeratePhysicalDevices(m_impl->instance, &count, devices);
+    if (ENUMRESULT != VK_SUCCESS && ENUMRESULT != VK_INCOMPLETE) {
+        log(AQ_LOG_ERROR, std::format("drm: MSC: enumerating Vulkan devices failed (VkResult {})", (int)ENUMRESULT));
+        return;
+    }
+    if (ENUMRESULT == VK_INCOMPLETE)
+        log(AQ_LOG_DEBUG,
+            std::format("drm: MSC: more than {} Vulkan devices present, considering the first {} (the compose render node is matched by DRM major:minor)", std::size(devices),
+                        count));
     for (uint32_t i = 0; i < count; ++i) {
         VkPhysicalDeviceDrmPropertiesEXT drm   = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2      props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm};
@@ -357,7 +360,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     // copy engine (dedicated DMA hardware, so the copies do not compete with the compositor's
     // rendering for the graphics engine), graphics for the graphics engine. Neither falls back.
     VkQueueFamilyProperties families[32];
-    count = 32;
+    count = (uint32_t)std::size(families);
     vkGetPhysicalDeviceQueueFamilyProperties(m_impl->physical, &count, families);
     bool found = false;
     if (m_impl->useCopyEngine) {
@@ -393,8 +396,8 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
 
     float                   priority = 0;
     VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = m_impl->queueFamily, .queueCount = 1, .pQueuePriorities = &priority};
-    const char*             devExts[] = {"VK_KHR_external_memory_fd",        "VK_KHR_external_semaphore_fd", "VK_EXT_external_memory_dma_buf",
-                                         "VK_EXT_image_drm_format_modifier", "VK_KHR_external_fence_fd",     "VK_EXT_queue_family_foreign"};
+    const char*             devExts[] = {"VK_KHR_external_memory_fd", "VK_KHR_external_semaphore_fd", "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier",
+                                         "VK_EXT_queue_family_foreign"};
     VkDeviceCreateInfo      dev       = {.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                          .queueCreateInfoCount    = 1,
                                          .pQueueCreateInfos       = &queue,
@@ -403,7 +406,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     if (vkCreateDevice(m_impl->physical, &dev, nullptr, &m_impl->device) != VK_SUCCESS) {
         log(AQ_LOG_ERROR,
             "drm: MSC: vkCreateDevice failed (needs VK_KHR_external_memory_fd, VK_KHR_external_semaphore_fd, VK_EXT_external_memory_dma_buf, "
-            "VK_EXT_image_drm_format_modifier, VK_KHR_external_fence_fd and VK_EXT_queue_family_foreign)");
+            "VK_EXT_image_drm_format_modifier and VK_EXT_queue_family_foreign)");
         return;
     }
     vkGetDeviceQueue(m_impl->device, m_impl->queueFamily, 0, &m_impl->queue);
@@ -435,6 +438,8 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     m_impl->importSemaphore  = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(m_impl->device, "vkImportSemaphoreFdKHR");
     m_impl->getSemaphoreFd   = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(m_impl->device, "vkGetSemaphoreFdKHR");
     m_impl->getMemoryFdProps = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(m_impl->device, "vkGetMemoryFdPropertiesKHR");
+    m_impl->getMemoryFd      = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(m_impl->device, "vkGetMemoryFdKHR");
+    vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &m_impl->memProps);
 
     m_bad = false;
 }
@@ -492,9 +497,8 @@ bool CMSCTransfer::allocateDestinationStorage(VkDeviceSize bytes, SMSCBufferStor
     // system memory: a host-visible *device-local* heap (BAR/VRAM on a discrete
     // GPU) cannot be fetched by i915 and its commit fails. Prefer a
     // non-device-local coherent heap and only fall back to device-local.
-    VkPhysicalDeviceMemoryProperties mem;
-    vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &mem);
-    uint32_t type = UINT32_MAX;
+    const auto& mem  = m_impl->memProps;
+    uint32_t    type = UINT32_MAX;
     for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
         const auto FLAGS = mem.memoryTypes[i].propertyFlags;
         if (!(req.memoryTypeBits & (1u << i)) || !(FLAGS & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(FLAGS & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
@@ -531,12 +535,14 @@ bool CMSCTransfer::allocateDestinationStorage(VkDeviceSize bytes, SMSCBufferStor
         return false;
     }
 
-    PFN_vkGetMemoryFdKHR get  = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(m_impl->device, "vkGetMemoryFdKHR");
+    const auto           get  = m_impl->getMemoryFd;
     VkMemoryGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = out.memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-    if (!get || get(m_impl->device, &info, &out.fd) != VK_SUCCESS) {
+    int                  fd   = -1;
+    if (!get || get(m_impl->device, &info, &fd) != VK_SUCCESS) {
         freeDestinationStorage(out);
         return false;
     }
+    out.fd = fd;
 
     return true;
 }
@@ -627,8 +633,7 @@ int CMSCTransfer::acquireSource(const SP<IBuffer>& src, const SDMABUFAttrs& attr
         return -1;
     }
 
-    VkPhysicalDeviceMemoryProperties mem;
-    vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &mem);
+    const auto&    mem     = m_impl->memProps;
     const uint32_t allowed = req.memoryTypeBits & fdProps.memoryTypeBits;
     VkDeviceMemory srcMem  = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < mem.memoryTypeCount && !srcMem; ++i) {
@@ -740,9 +745,11 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     }
 
     // The destination is one of a rotating set and every buffer in it has to catch up on the frames
-    // it sat out, so this frame's damage is added to all of them; each forgets it once written.
-    // Only destinations of this frame's size consume it: the cursor destination and any other
-    // resolution would otherwise accumulate damage they never clear.
+    // it sat out, so this frame's damage is added to all of them, the one being written included;
+    // each forgets it once written. Only destinations of this frame's size consume it: the cursor
+    // destination and any other resolution would otherwise accumulate damage they never clear.
+    // (Recording it only in the destination being written measured the same copy volume; it stays
+    // for a consumer whose damage is not accumulated over the buffer's age.)
     if (trackDamage && SAMESIZE) {
         bool known = false;
         for (auto it = m_impl->frameDestinations.begin(); it != m_impl->frameDestinations.end();) {
@@ -768,21 +775,27 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     // never describe another output (or the cursor) and run past the destination buffer.
     pending.intersect(0, 0, (double)WIDTH, (double)HEIGHT);
 
+    // Extract the boxes and their area once: pixman's rect array is already disjoint and sorted,
+    // while getRects() would build a fresh vector on every call.
+    int                   damageRectCount = 0;
+    const pixman_box32_t* DAMAGE          = pixman_region32_rectangles(pending.pixman(), &damageRectCount);
+    uint64_t              damageArea      = 0;
+    for (int i = 0; i < damageRectCount; ++i)
+        damageArea += (uint64_t)(DAMAGE[i].x2 - DAMAGE[i].x1) * (uint64_t)(DAMAGE[i].y2 - DAMAGE[i].y1);
+
     ECopyMode mode;
     if (!trackDamage || !SAMESIZE || !mscDst->seeded() || !damage)
         mode = ECopyMode::Full;
     else if (pending.empty())
         mode = ECopyMode::Skip;
-    else if (pending.getRects().size() > MSC_DAMAGE_MAX_RECTS || (double)regionArea(pending) > MSC_DAMAGE_FULL_FRACTION * (double)WIDTH * (double)HEIGHT)
+    else if (damageRectCount > (int)MSC_DAMAGE_MAX_RECTS || (double)damageArea > MSC_DAMAGE_FULL_FRACTION * (double)WIDTH * (double)HEIGHT)
         mode = ECopyMode::Full; // past the point where the bookkeeping pays for itself
     else
         mode = ECopyMode::Partial;
 
-    const std::vector<pixman_box32_t> BOXES = mode == ECopyMode::Partial ? pending.getRects() : std::vector<pixman_box32_t>{};
-
-    const uint64_t                    FRAMEPIXELS = (uint64_t)WIDTH * (uint64_t)HEIGHT;
-    const auto                        ACCOUNT     = [&](ECopyMode taken, size_t rects) {
-        const uint64_t MOVED = taken == ECopyMode::Full ? FRAMEPIXELS : regionArea(pending);
+    const uint64_t FRAMEPIXELS = (uint64_t)WIDTH * (uint64_t)HEIGHT;
+    const auto     ACCOUNT     = [&](ECopyMode taken, size_t rects) {
+        const uint64_t MOVED = taken == ECopyMode::Full ? FRAMEPIXELS : damageArea;
         m_impl->damageFramePixels += FRAMEPIXELS;
         m_impl->damagePixels += MOVED;
         m_impl->damageRects += rects;
@@ -873,8 +886,11 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
         }
 
         if (!gpuWait) {
+            // An errored producer fence is a failure, not a ready one, and a signal in this process
+            // must not drop the frame (same rule as mscWaitCopyFence).
             struct pollfd p = {.fd = waitFd, .events = POLLIN};
-            if (poll(&p, 1, 1000) != 1)
+            while (poll(&p, 1, 1000) == -1 && errno == EINTR) {}
+            if (!(p.revents & POLLIN))
                 return false;
         }
     }
@@ -897,28 +913,31 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
                                     .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(SLOT.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
 
-    std::vector<VkBufferImageCopy> regions;
+    // The rect count is bounded: Partial is only taken when there are at most this many, so the
+    // regions can live on the stack instead of a heap vector.
+    std::array<VkBufferImageCopy, MSC_DAMAGE_MAX_RECTS> REGIONS{};
+    uint32_t                                            regionCount = 0;
     if (mode == ECopyMode::Full) {
-        regions.push_back({.bufferOffset      = 0,
-                           .bufferRowLength   = mscDst->storage().stride / 4,
-                           .bufferImageHeight = HEIGHT,
-                           .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                           .imageExtent       = {WIDTH, HEIGHT, 1}});
+        REGIONS[regionCount++] = {.bufferOffset      = 0,
+                                  .bufferRowLength   = mscDst->storage().stride / 4,
+                                  .bufferImageHeight = HEIGHT,
+                                  .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent       = {WIDTH, HEIGHT, 1}};
     } else {
-        regions.reserve(BOXES.size());
-        for (const auto& BOX : BOXES) {
+        for (int i = 0; i < damageRectCount; ++i) {
+            const auto& BOX = DAMAGE[i];
             // Both offsets are needed: imageOffset selects the box in the source frame and
             // bufferOffset places it at the same coordinates in the destination buffer. Without
             // imageOffset every box is fed the frame's top-left corner.
-            regions.push_back({.bufferOffset      = (VkDeviceSize)BOX.y1 * mscDst->storage().stride + (VkDeviceSize)BOX.x1 * 4,
-                               .bufferRowLength   = mscDst->storage().stride / 4,
-                               .bufferImageHeight = HEIGHT,
-                               .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                               .imageOffset       = {(int32_t)BOX.x1, (int32_t)BOX.y1, 0},
-                               .imageExtent       = {(uint32_t)(BOX.x2 - BOX.x1), (uint32_t)(BOX.y2 - BOX.y1), 1}});
+            REGIONS[regionCount++] = {.bufferOffset      = (VkDeviceSize)BOX.y1 * mscDst->storage().stride + (VkDeviceSize)BOX.x1 * 4,
+                                      .bufferRowLength   = mscDst->storage().stride / 4,
+                                      .bufferImageHeight = HEIGHT,
+                                      .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                      .imageOffset       = {(int32_t)BOX.x1, (int32_t)BOX.y1, 0},
+                                      .imageExtent       = {(uint32_t)(BOX.x2 - BOX.x1), (uint32_t)(BOX.y2 - BOX.y1), 1}};
         }
     }
-    vkCmdCopyImageToBuffer(SLOT.command, SOURCE.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, (uint32_t)regions.size(), regions.data());
+    vkCmdCopyImageToBuffer(SLOT.command, SOURCE.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mscDst->storage().buffer, regionCount, REGIONS.data());
 
     VkImageMemoryBarrier release = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                     .srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
@@ -932,21 +951,33 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     if (!checkResult(vkEndCommandBuffer(SLOT.command), "ending a copy command buffer"))
         return false;
 
-    VkSemaphore          WAITSEM      = SLOT.incoming;
-    VkPipelineStageFlags WAITSTAGE    = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo         submit       = {.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                         .waitSemaphoreCount   = gpuWait ? 1u : 0u,
-                                         .pWaitSemaphores      = gpuWait ? &WAITSEM : nullptr,
-                                         .pWaitDstStageMask    = gpuWait ? &WAITSTAGE : nullptr,
-                                         .commandBufferCount   = 1,
-                                         .pCommandBuffers      = &SLOT.command,
-                                         .signalSemaphoreCount = 1,
-                                         .pSignalSemaphores    = &SLOT.outgoing};
-    VkResult             submitResult = vkResetFences(m_impl->device, 1, &SLOT.fence);
-    if (submitResult == VK_SUCCESS)
-        submitResult = vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence);
-    if (!checkResult(submitResult, "submitting the copy"))
+    VkSemaphore WAITSEM = SLOT.incoming;
+    // ALL_COMMANDS is the only stage that synchronizes with the QFOT acquire below: acquire and
+    // release do not run in a defined stage, so a wait at TRANSFER would not order it.
+    VkPipelineStageFlags WAITSTAGE = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo         submit    = {.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                      .waitSemaphoreCount   = gpuWait ? 1u : 0u,
+                                      .pWaitSemaphores      = gpuWait ? &WAITSEM : nullptr,
+                                      .pWaitDstStageMask    = gpuWait ? &WAITSTAGE : nullptr,
+                                      .commandBufferCount   = 1,
+                                      .pCommandBuffers      = &SLOT.command,
+                                      .signalSemaphoreCount = 1,
+                                      .pSignalSemaphores    = &SLOT.outgoing};
+    // A fence cannot be signalled by hand: a failed reset, or a submit that failed after one, leaves
+    // a slot nothing will signal, so rebuild rather than stall on it three copies later.
+    const VkResult RESETSTATE = vkResetFences(m_impl->device, 1, &SLOT.fence);
+    if (RESETSTATE != VK_SUCCESS) {
+        checkResult(RESETSTATE, "resetting a copy slot fence");
+        m_bad = true;
         return false;
+    }
+
+    const VkResult SUBMITSTATE = vkQueueSubmit(m_impl->queue, 1, &submit, SLOT.fence);
+    if (!checkResult(SUBMITSTATE, "submitting the copy")) {
+        if (SUBMITSTATE != VK_ERROR_DEVICE_LOST)
+            m_bad = true;
+        return false;
+    }
 
     // The copy is in flight, so the import belongs to this slot until its fence signals. markSynced
     // records the destination as holding this frame at submit; the KMS in-fence, not the
@@ -958,8 +989,13 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
 
     VkSemaphoreGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = SLOT.outgoing, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
     int                     fd   = -1;
-    if (!m_impl->getSemaphoreFd || m_impl->getSemaphoreFd(m_impl->device, &info, &fd) != VK_SUCCESS)
+    if (!m_impl->getSemaphoreFd || m_impl->getSemaphoreFd(m_impl->device, &info, &fd) != VK_SUCCESS) {
+        // Exporting the semaphore is what resets it (SYNC_FD is copy transference), so a slot that
+        // failed to export must not be signalled again (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+        log(AQ_LOG_ERROR, "drm: MSC: exporting the copy completion fence failed, the copy engine will be rebuilt");
+        m_bad = true;
         return false;
+    }
     outFence = Hyprutils::OS::CFileDescriptor{fd};
 
     ++m_impl->copies;
@@ -968,7 +1004,7 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     else
         ++m_impl->hostWaits;
 
-    ACCOUNT(mode, BOXES.size());
+    ACCOUNT(mode, mode == ECopyMode::Partial ? (size_t)regionCount : 0);
 
     return true;
 }

@@ -133,7 +133,7 @@ The copy is submitted to one queue family, chosen up front and with no fallback:
 - `AQ_MSC_QUEUE=graphics` - a `GRAPHICS` family. Refused if the requested family does not
   exist.
 
-The device is created with the external-memory/semaphore/fence extensions,
+The device is created with the external-memory and external-semaphore extensions,
 `VK_EXT_image_drm_format_modifier` (for the modifier import) and
 `VK_EXT_queue_family_foreign`, and the copy runs through a **three-deep pipeline**: three
 command buffers, each with its own fence, its own exportable completion semaphore, and its
@@ -175,8 +175,9 @@ rotates through.
 Everything is kept on the GPU where possible:
 
 - the producer's fence (`explicitInFence`) is `dup`'d, imported as a `SYNC_FD` semaphore on
-  the slot, and the queue waits on it before the copy; if the import is refused, the copy
-  falls back to polling the fence on the host;
+  the slot, and the queue waits on it before the copy (at `ALL_COMMANDS`: a queue-family
+  transfer does not run in a defined stage, so a narrower wait would not order it); if the
+  import is refused, the copy falls back to polling the fence on the host;
 - the copy's completion is the slot's outgoing semaphore exported as a `SYNC_FD`, returned
   as the commit's in-fence. When the CRTC has no explicit sync, KMS would drop the fence,
   so the copy is waited on before the commit instead (debug toggle `AQ_MSC_NO_FENCE=1`
@@ -213,11 +214,13 @@ Per copy, the owed set is clipped to the frame and decides the mode:
 - The display GPU **never gets an EGL renderer** (the secondary-renderer path returns early);
   it only keeps its KMS device. The cursor is handled like a frame, copied into its own small
   destination (see *The destination buffer*).
-- A **fatal copy failure** (a lost device, or a copy slot that never signalled) marks the
-  engine bad; the next commit rebuilds it - dropping the transfer and its allocator, which
-  makes the destination swapchains reallocate - up to 4 times per failure episode, and the
-  budget resets once a rebuilt engine has actually copied a frame. After that the outputs
-  freeze with the log saying why.
+- A **fatal copy failure** marks the engine bad; the next commit rebuilds it - dropping the
+  transfer and its allocator, which makes the destination swapchains reallocate - up to 4 times
+  per failure episode, and the budget resets once a rebuilt engine has actually copied a frame.
+  After that the outputs freeze with the log saying why. What counts as fatal is anything the
+  engine cannot recover from in place: a lost device, a copy slot that never signalled, a
+  submission that failed after its fence had been reset, or a completion fence that could not be
+  exported (the export is what makes the slot's semaphore reusable).
 - On **exit**, the process' static destructors can run after the NVIDIA driver's core
   library has been unloaded, so a plain `vkDestroyDevice` faults. An `atexit` handler
   marks the exit and the destructors then leak the Vulkan objects instead of calling into

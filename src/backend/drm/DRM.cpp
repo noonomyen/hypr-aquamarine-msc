@@ -1529,12 +1529,13 @@ SP<CMSCTransfer>          Aquamarine::CDRMBackend::mscTransfer() {
     ++mscAttempts;
     // scanGPUs validated this already: transfer or graphics, nothing else reaches here
     const char* queue         = getenv("AQ_MSC_QUEUE");
+    const char* copy          = getenv("AQ_MSC_COPY");
     const bool  useCopyEngine = !queue || std::string{queue} == "transfer";
     msc                       = CMSCTransfer::create(self, backend.lock(), useCopyEngine);
     if (msc) {
         mscCopiesAtBuild = msc->copyCount();
         backend->log(AQ_LOG_DEBUG,
-                     std::format("drm: MSC ready (copy {}, queue {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", getenv("AQ_MSC_COPY"),
+                     std::format("drm: MSC ready (copy {}, queue {}): compose {} copies into linear scanout buffers, the display GPU stays render-free", copy ? copy : "<unset>",
                                  queue ? queue : "<unset>", gpu->path));
     } else
         backend->log(AQ_LOG_ERROR,
@@ -2633,6 +2634,14 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
         if (!mscReady(MSC, MSCALLOC))
             return false;
 
+        // Without explicit sync the copy has to be waited on before the commit, which this path
+        // cannot do: refuse before a destination is taken, so the caller's synchronous retry sees
+        // an untouched swapchain and untouched per-destination damage. Same for AQ_MSC_NO_FENCE.
+        if (!supportsExplicit || mscFencesDisabled()) {
+            requiresSync = true;
+            return false;
+        }
+
         auto NEW_BUFFER = mgpuNextBuffer(MSCALLOC, mgpu.swapchain, STATE.buffer->size, STATE.buffer->dmabuf().format, false, &requiresSync);
         if (!NEW_BUFFER)
             return false;
@@ -2646,13 +2655,7 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
             return false;
         }
 
-        // A missing fence means copy() skipped the frame (the destination already holds it), which
-        // needs no in-fence. Only a real copy on a CRTC without explicit sync has to wait.
-        if (copyFence.isValid() && (!supportsExplicit || mscFencesDisabled())) {
-            requiresSync = true;
-            return false;
-        }
-
+        // An invalid fence means the frame was skipped: there is nothing to wait for.
         mgpuFence                        = std::move(copyFence);
         data.outputState.explicitInFence = mgpuFence.get();
 

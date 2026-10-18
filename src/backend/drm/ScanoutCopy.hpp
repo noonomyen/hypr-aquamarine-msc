@@ -133,12 +133,12 @@ namespace Aquamarine {
         // The damage this destination still owes: what a copy has to move the next time this
         // buffer is written. It belongs to the buffer, because the ring is what makes a frame
         // miss damage, and a buffer that has never been filled is not in sync with anything.
-        Hyprutils::Math::CRegion m_pendingDamage;
-        bool                     m_seeded = false;
+        Hyprutils::Math::CRegion        m_pendingDamage;
+        bool                            m_seeded = false;
 
-        Hyprutils::Math::CRegion pendingDamage();
-        bool                     seeded() const;
-        void                     markSynced();
+        const Hyprutils::Math::CRegion& pendingDamage() const;
+        bool                            seeded() const;
+        void                            markSynced();
         // Every frame's damage goes to every destination in the rotating set, not only the one
         // being written; each buffer forgets what it owes once it has been written again.
         void accumulateDamage(const Hyprutils::Math::CRegion& region);
