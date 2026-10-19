@@ -1,0 +1,108 @@
+#version 450
+// Grid damage scan: one workgroup per candidate cell. A cell compares the source image against the
+// shadow (the content we scanned last) and writes the differing pixels into the shadow, so the
+// shadow always holds the last scanned frame. The cell's dirty word is set when any pixel differed.
+// Cells outside the candidate rectangles are never looked at: the compositor's damage is a superset
+// of what changed, so the copy that follows can trust the result.
+//
+// The alpha channel is not compared: a source the compositor produced as XRGB8 carries no meaning
+// in that byte, and comparing it would mark cells dirty that did not change.
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform sampler2D srcImg;
+layout(binding = 1, rgba8) uniform image2D shadowImg;
+layout(binding = 2, std430) buffer Dirty {
+    uint dirty[];
+}
+d;
+layout(binding = 3, std430) readonly buffer Cands {
+    uvec4 cands[];
+}
+c;
+
+layout(push_constant) uniform Params {
+    uint cell;   // cell size in pixels
+    uint cols;   // grid columns
+    uint rows;   // grid rows
+    uint fresh;  // 1 = every candidate cell is dirty without comparing (the shadow was just created)
+    uint frameW;
+    uint frameH;
+}
+p;
+
+shared uint s_any[64];
+
+void main() {
+    const uint wg = gl_WorkGroupID.x;
+
+    uint  idx = wg;
+    uvec4 rect = uvec4(0u);
+    for (uint i = 0u; i < 16u; ++i) {
+        const uvec4 C = c.cands[i];
+        if (C.z == 0u || C.w == 0u)
+            continue;
+        const uint n = C.z * C.w;
+        if (idx < n) {
+            rect = C;
+            break;
+        }
+        idx -= n;
+    }
+    if (rect.z == 0u || rect.w == 0u)
+        return;
+
+    const uint cx = rect.x + idx % rect.z;
+    const uint cy = rect.y + idx / rect.z;
+    if (cx >= p.cols || cy >= p.rows)
+        return;
+
+    const ivec2 base = ivec2(int(cx * p.cell), int(cy * p.cell));
+    const uint  dst  = cy * p.cols + cx;
+
+    uint changed      = 0u;
+    const uint pixels = p.cell * p.cell;
+    for (uint i = gl_LocalInvocationID.x; i < pixels; i += gl_WorkGroupSize.x) {
+        const ivec2 pos = base + ivec2(int(i % p.cell), int(i / p.cell));
+        if (pos.x >= int(p.frameW) || pos.y >= int(p.frameH))
+            continue;
+        const vec4 cur = texelFetch(srcImg, pos, 0);
+        if (p.fresh >= 2u) {
+            const vec3 b = mix(cur.rgb, vec3(1.0, 0.0, 0.0), 0.35);
+            if (p.fresh == 2u)
+                imageStore(shadowImg, pos, vec4(b.bgr, 1.0));
+            else if (p.fresh == 3u)
+                imageStore(shadowImg, pos, vec4(b.rgb, 1.0));
+            else {
+                const uint  r     = uint(round(b.r * 1023.0)) & 1023u;
+                const uint  g     = uint(round(b.g * 1023.0)) & 1023u;
+                const uint  bl    = uint(round(b.b * 1023.0)) & 1023u;
+                const uint  w     = (p.fresh == 4u) ? ((3u << 30) | (r << 20) | (g << 10) | bl) : ((3u << 30) | (bl << 20) | (g << 10) | r);
+                const uvec4 bytes = uvec4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, (w >> 24) & 255u);
+                imageStore(shadowImg, pos, vec4(bytes) / 255.0);
+            }
+            continue;
+        }
+        if (p.fresh != 0u) {
+            imageStore(shadowImg, pos, cur);
+            changed = 1u;
+            continue;
+        }
+        const vec4 prev = imageLoad(shadowImg, pos);
+        if (uvec3(round(cur.rgb * 255.0)) != uvec3(round(prev.rgb * 255.0))) {
+            imageStore(shadowImg, pos, cur);
+            changed = 1u;
+        }
+    }
+    if (p.fresh >= 2u)
+        return;
+
+    s_any[gl_LocalInvocationID.x] = changed;
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        uint acc = 0u;
+        for (uint i = 0u; i < gl_WorkGroupSize.x; ++i)
+            acc |= s_any[i];
+        if (acc != 0u)
+            d.dirty[dst] = 1u;
+    }
+}

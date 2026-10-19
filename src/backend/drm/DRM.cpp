@@ -221,10 +221,13 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
     //   AQ_MSC=0|1              switch
     //   AQ_MSC_COPY=<name>      how the copy is performed (vulkan only)
     //   AQ_MSC_QUEUE=<name>     queue family the copy runs on: transfer (the async copy
-    //                           engine, so it does not compete with rendering) or graphics
+    //                           engine, so it does not compete with rendering; the default) or graphics
     //   AQ_MSC_DISPLAY=<path>   gpu display (display only)
     //   AQ_MSC_COMPOSE=<path>   gpu compose
-    //   AQ_MSC_DAMAGE=<0|1>      follow the compositor's damage (default) or copy whole frames
+    //   AQ_MSC_DAMAGE=<mode>    0|off copies whole frames, compositor follows the damage the
+    //                           compositor reports, compositor+grid scans the reported area for
+    //                           what really changed, grid scans the whole frame and ignores the
+    //                           compositor (default: compositor)
     //   AQ_MSC_STATS=<seconds>   how often the copy counters are logged (default 60, 0 disables)
     //   AQ_MSC_NO_FENCE=<0|1>    debug: commit without handing the copy fence to KMS
     // Everything here is skipped when AQ_MSC is not enabled, so the unpatched
@@ -247,9 +250,19 @@ static std::vector<SP<CSessionDevice>> scanGPUs(SP<CBackend> backend) {
             return {};
         }
 
-        if (!mscQueue || (std::string{mscQueue} != "transfer" && std::string{mscQueue} != "graphics")) {
-            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_QUEUE must be transfer or graphics (got {}), refusing to start", mscQueue ? mscQueue : "<unset>"));
+        // Unset means transfer (the async copy engine); an explicit value must be one of the two.
+        if (mscQueue && *mscQueue && (std::string{mscQueue} != "transfer" && std::string{mscQueue} != "graphics")) {
+            backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_QUEUE must be transfer or graphics (got {}), refusing to start", mscQueue));
             return {};
+        }
+
+        const char* mscDamage = getenv("AQ_MSC_DAMAGE");
+        if (mscDamage && *mscDamage) {
+            const std::string DM{mscDamage};
+            if (DM != "0" && DM != "off" && DM != "1" && DM != "compositor" && DM != "compositor+grid" && DM != "grid") {
+                backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MSC_DAMAGE must be 0, compositor, compositor+grid or grid (got {}), refusing to start", mscDamage));
+                return {};
+            }
         }
 
         if (!composeDevice || !displayDevice) {
@@ -578,7 +591,7 @@ void Aquamarine::CDRMBackend::emitAsyncCommitEvent(SP<CDRMOutput> output) {
 
 void Aquamarine::CDRMBackend::flushAsyncCommitEvents() {
     for (const auto& connector : connectors) {
-        if (connector->output && connector->output->asyncCommitEventPending)
+        if (connector && connector->output && connector->output->asyncCommitEventPending)
             emitAsyncCommitEvent(connector->output);
     }
 }

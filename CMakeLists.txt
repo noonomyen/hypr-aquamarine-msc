@@ -169,6 +169,15 @@ add_test(
   COMMAND scanoutCopyFormat "scanoutCopyFormat")
 add_dependencies(tests scanoutCopyFormat)
 
+add_executable(scanoutCopyDamage "tests/ScanoutCopyDamage.cpp")
+target_include_directories(scanoutCopyDamage PRIVATE "./src/backend/drm")
+target_link_libraries(scanoutCopyDamage PRIVATE PkgConfig::deps aquamarine)
+add_test(
+  NAME "scanoutCopyDamage"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
+  COMMAND scanoutCopyDamage "scanoutCopyDamage")
+add_dependencies(tests scanoutCopyDamage)
+
 add_executable(commitThread "tests/CommitThread.cpp")
 target_include_directories(commitThread PRIVATE "./src/backend/drm")
 target_link_libraries(commitThread PRIVATE PkgConfig::deps aquamarine)

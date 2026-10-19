@@ -9,6 +9,7 @@
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <drm_fourcc.h>
 #include <memory>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace Aquamarine {
@@ -60,6 +61,16 @@ namespace Aquamarine {
         }
     }
 
+    struct SMSCDamageRect {
+        int32_t x = 0, y = 0, w = 0, h = 0;
+    };
+
+    // Turn dirty grid cells into copy rectangles: horizontal runs inside each cell row, then a
+    // vertical merge of runs that share an x range, then cheapest-pair merges until the rectangle
+    // count fits `cap`. Every rectangle is clipped to the frame, because the last grid row and
+    // column are short and a copy outside the image faults the device.
+    std::vector<SMSCDamageRect> mscMergeCells(const std::vector<SMSCDamageRect>& cells, uint32_t cap, uint32_t frameW, uint32_t frameH);
+
     class CMSCTransfer {
       public:
         static Hyprutils::Memory::CSharedPointer<CMSCTransfer> create(Hyprutils::Memory::CWeakPointer<CDRMBackend> primary, Hyprutils::Memory::CSharedPointer<CBackend> logBackend,
@@ -91,6 +102,19 @@ namespace Aquamarine {
 
         bool allocateDestinationStorage(VkDeviceSize bytes, SMSCBufferStorage& out);
         void freeDestinationStorage(SMSCBufferStorage& storage);
+
+        // Grid damage scan: create the pass, run it for one frame and return the merged copy
+        // rectangles. `hint` is the compositor's damage (a superset of what changed), or null to
+        // scan the whole frame; the shadow is refreshed with what the pass saw.
+        bool scanInit();
+        bool scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width, uint32_t height, uint32_t fourcc, VkImage srcImage, VkImageView srcView, int waitFd,
+                     bool& waitedOnProducer, std::vector<SMSCDamageRect>& out);
+        void scanDestroy();
+
+        // Blink: an image holding the alpha-blended red highlight for the decided damage, used as
+        // the copy source for the damaged boxes so the regions the copy touched are visible.
+        bool ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t width, uint32_t height, uint32_t fourcc, VkImage srcImage, VkImageView srcView, int waitFd,
+                         bool& waitedOnProducer);
 
         // One import per producer buffer, kept while the compositor still holds it: importing
         // one costs a vkCreateImage plus a dedicated allocation of its dma-buf.
@@ -125,6 +149,10 @@ namespace Aquamarine {
 
       private:
         friend class CMSCTransfer;
+
+        // Regions this destination had painted with the blink colour last time it was written, so
+        // the next write can restore them from the real source before painting the new damage.
+        Hyprutils::Math::CRegion                        m_tintedSet;
 
         SMSCBufferStorage&                              storage();
         Hyprutils::Memory::CSharedPointer<CMSCTransfer> m_transfer;

@@ -30,7 +30,9 @@ display directly, and the iGPU only ever scans it out.
 
 The copy only moves what changed on screen: a frame where nothing changed is skipped
 entirely, and a small change moves only that part of the frame. It falls back to copying
-the whole frame whenever it cannot be sure what changed.
+the whole frame whenever it cannot be sure what changed. The grid modes go one step further:
+they scan the reported area against the previous frame, so a program that repaints its whole
+window only costs the pixels that really moved (see `AQ_MSC_DAMAGE` below).
 
 ## Usage
 
@@ -58,11 +60,15 @@ in the log:
 | --- | --- | --- | --- |
 | `AQ_MSC` | to enable | `1` | enable the scanout copy; `0`/unset is stock Aquamarine, anything else refuses |
 | `AQ_MSC_COPY` | yes | `vulkan` | how the copy is performed (`vulkan` is the only value) |
-| `AQ_MSC_QUEUE` | yes | `transfer` \| `graphics` | the queue family the copy is submitted to: `transfer` = the async copy engine (needs a transfer-only family on the compose GPU, and there is no fallback), `graphics` = the 3D engine |
+| `AQ_MSC_QUEUE` | no | `transfer` (default) \| `graphics` | the queue family the copy is submitted to: `transfer` = the async copy engine (needs a transfer-only family on the compose GPU, and there is no fallback), `graphics` = the 3D engine |
 | `AQ_MSC_COMPOSE` | yes | a card node, e.g. `/dev/dri/card0` | the GPU that renders the frame and runs the copy |
 | `AQ_MSC_DISPLAY` | yes | a card node, e.g. `/dev/dri/card1` | the GPU that only scans out |
-| `AQ_MSC_DAMAGE` | no | `1` (default) \| `0` | follow the compositor's damage and copy only what changed; `0` copies whole frames. Anything but `0` counts as on. |
+| `AQ_MSC_DAMAGE` | no | `compositor` (default) \| `compositor+grid` \| `grid` \| `0` | what the copy follows: `compositor` = only what the compositor reports, `compositor+grid` = the reported area scanned against the previous frame so only what really changed is copied, `grid` = scan the whole frame and ignore the compositor, `0` = whole frames. `1` means the default. |
+| `AQ_MSC_GRID_DAMAGE_CELL` | no | `64` (default) \| any power of two from `8` to `512` | cell size of the damage grid; a smaller cell copies less around a change but schedules far more scan work per frame, a larger cell does the opposite. |
+| `AQ_MSC_DAMAGE_BLINK` | no | unset \| `1` | debug: paint the regions the copy decided to move with a translucent red overlay, so the damage logic is visible on screen. It corrupts the picture by design and does nothing when unset. |
 | `AQ_MSC_STATS` | no | seconds (default `60`) \| `0` | how often the engine logs its counters (copies, waits, damage distribution, why frames were copied whole); `0` turns the reports off. A negative or unparsable value also turns them off, silently. |
+
+The grid modes read the frame on the compose GPU and run on a compute queue of that GPU, so they cost memory bandwidth and share the GPU with the compositor's rendering. They pay off when the reported damage is much larger than what actually changed - a capture, or software that does not report damage and repaints its whole surface, which is also why there is no hint-size gate: gating on a large hint would switch the scan off exactly for those clients. They add cost when the damage was already tight or the frame budget is tiny (very high frame rates), so the mode is opt-in and the cell size is the tuning knob.
 
 Debug only:
 
@@ -101,8 +107,10 @@ the pointer is then composited into the frame.
 
 ## Limits
 
-- the damage copy pays only for small changes: full-screen content (video, scrolling, games)
+- the damage copy pays only for small changes: full-screen content (video, continuous motion)
   still moves whole frames;
+- the grid modes add a scan per frame, so on a frame budget that is already tight (very high
+  frame rates) the scan can cost more than the copy it saves;
 - a second output on the display GPU is untested;
 - HDR / 10-bit, scaled modes and multi-GPU output are untested;
 - there is no fallback: if the copy cannot be built, or the requested queue is not

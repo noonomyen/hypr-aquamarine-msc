@@ -36,9 +36,12 @@ flowchart TB
       SRC["source import cache (16 entries, LRU)<br/>VkImage with the producer's modifier"]
       FQ["acquire / release from the foreign queue family"]
       SLOT["copy pipeline, 3 slots:<br/>VkCommandBuffer + VkFence<br/>+ incoming SYNC_FD semaphore<br/>+ outgoing SYNC_FD semaphore"]
-      QUEUE["queue family: transfer-only (async copy engine) or graphics"]
+      SCAN["grid scan (compositor+grid / grid)<br/>compute queue, one workgroup per cell<br/>shadow image + dirty words"]
+      QUEUE["copy queue family: transfer-only (async copy engine) or graphics"]
       QUEUE --> SLOT
       SRC --> FQ --> SLOT
+      SRC --> SCAN
+      SCAN -->|"dirty cells merged into boxes"| SLOT
     end
     subgraph RING["destination ring (CSwapchain of CMSCBuffer)"]
       PEND["each buffer: owed damage + seeded"]
@@ -48,6 +51,7 @@ flowchart TB
   BUF -->|"import once"| SRC
   INF -->|"dup, import as a SYNC_FD semaphore"| SLOT
   DMG -->|"added to every destination of the same size"| PEND
+  DMG -->|"hinted cells"| SCAN
   PEND -->|"skip / boxes / full"| SLOT
   SLOT -->|"vkCmdCopyImageToBuffer"| DSTB
   SLOT -->|"copy completion fence"| FIF["IN_FENCE_FD"]
@@ -69,7 +73,8 @@ flowchart TB
 2. The frame leaves EGL as a plain **dma-buf** - a file descriptor, a DRM format modifier,
    a stride and an offset. MSC never touches EGL, it imports that dma-buf into Vulkan on the
    same GPU (see *The source import*).
-3. The damage is turned into the boxes the copy has to move (see *Damage tracking*).
+3. The damage is turned into the boxes the copy has to move (see *Damage tracking*), and in the
+   grid modes it is scanned against the previous frame first (see *The grid damage pass*).
 4. On the compose GPU's Vulkan device the copy reads the source image and writes those boxes
    into the **destination buffer**, a linear system-memory dma-buf (see *The destination
    buffer*).
@@ -85,8 +90,11 @@ sequenceDiagram
   participant P as panel
   H->>M: commit(buffer, damage, producer fence)
   M->>M: add the damage to every same-size destination in the ring
-  M->>M: pick the next destination and its owed boxes -> skip / boxes / full
-  M->>M: wait the producer fence, imported as a semaphore
+  opt compositor+grid or grid
+    M->>M: wait the producer fence, scan the hinted cells against the shadow, store what changed
+    M->>M: merge the dirty cells into boxes (runs, vertical merge, cap)
+  end
+  M->>M: pick the next destination and its owed boxes + this frame's boxes -> skip / boxes / full
   M->>M: vkCmdCopyImageToBuffer (a region per box, or one whole frame)
   M->>G: commit the destination with the copy fence as IN_FENCE_FD
   G->>P: scan out once the fence signals
@@ -133,6 +141,10 @@ The copy is submitted to one queue family, chosen up front and with no fallback:
 - `AQ_MSC_QUEUE=graphics` - a `GRAPHICS` family. Refused if the requested family does not
   exist.
 
+The grid scan is not a transfer command, so it does not run on that family: when a grid mode is
+active it gets a queue of its own from the compute-capable family (a second queue from the same
+family when the copy already uses one).
+
 The device is created with the external-memory and external-semaphore extensions,
 `VK_EXT_image_drm_format_modifier` (for the modifier import) and
 `VK_EXT_queue_family_foreign`, and the copy runs through a **three-deep pipeline**: three
@@ -145,7 +157,8 @@ the host-wait fallbacks below) is where the compositor thread can block on the G
 A producer buffer is imported **once** and cached. The import creates a `VkImage` from the
 buffer's dma-buf with the producer's DRM format modifier
 (`VkImageDrmFormatModifierExplicitCreateInfoEXT`, tiling `DRM_FORMAT_MODIFIER`) and usage
-`TRANSFER_SRC`, then binds the dma-buf fd as its memory. Entries are keyed by the buffer,
+`TRANSFER_SRC` (plus `SAMPLED` while a grid mode is active, for the scan), then binds the
+dma-buf fd as its memory. Entries are keyed by the buffer,
 its format, modifier, size, stride and offset, kept while the compositor still holds the
 buffer, and evicted least-recently-used once the cache is full (16 entries), never while a
 copy that reads them is still in flight.
@@ -204,15 +217,65 @@ Per copy, the owed set is clipped to the frame and decides the mode:
   coordinates in the destination, `bufferRowLength` is the destination row length in pixels,
   the stride / 4);
 - **full** - the whole frame, used when the tracking cannot be trusted: a destination that
-  has never been filled, a frame with no reported damage, more than 16 boxes, or nearly the
-  whole frame (90%) changed. A partial copy is one box per rect and a box's rows are
-  contiguous, so copying 90% as boxes costs about what a whole frame costs.
+  has never been filled, a frame with no reported damage, or nearly the whole frame (90%)
+  changed. A partial copy is one box per rect and a box's rows are contiguous, so copying 90%
+  as boxes costs about what a whole frame costs. The owed set is merged down to the rectangle
+  cap before this decision, so the number of boxes on its own no longer forces a whole frame.
 
-`AQ_MSC_DAMAGE=0` turns the whole thing off and copies whole frames.
+`AQ_MSC_DAMAGE` picks where the boxes come from: `compositor` (the default) follows the reported
+damage, `compositor+grid` and `grid` add the scan (see *The grid damage pass*), and `0` copies whole
+frames.
 
-The engine also reports its counters (copies, waits, the damage distribution, and why frames were
-copied whole) once every 60 s; `AQ_MSC_STATS=<seconds>` changes the interval and `AQ_MSC_STATS=0`
-turns the reports off.
+The engine also reports its counters (copies, waits, the damage distribution, why frames were
+copied whole, and for the grid modes the cells scanned, how many were dirty and the scan's time per
+frame) once every 60 s; `AQ_MSC_STATS=<seconds>` changes the interval and `AQ_MSC_STATS=0` turns the
+reports off.
+
+### The grid damage pass (`compositor+grid` and `grid`)
+
+The copy can check the reported damage against the pixels before it records anything. `compositor` (the default) keeps the reported damage without the scan; `compositor+grid` adds the scan.
+
+- The scan runs on a compute queue of its own: a second queue from the compute-capable family, or
+  a second queue from the copy family when the two are the same. The copy keeps the family it was
+  given. The host orders the two - the dirty map has to be back before the copy can be recorded -
+  so no semaphore crosses the queues, but the source image is acquired for the scan family and
+  released back to the foreign family before the copy acquires it for its own.
+- The shadow is a device-local image of the frame's size and format. One workgroup per cell
+  compares the source against it with raw texel values (the alpha channel is ignored: an XRGB source
+  carries nothing there), stores the differing pixels back into the shadow and sets the cell's dirty
+  word. The first scan after the shadow is created stores the source instead of comparing, so a
+  fresh shadow can never hide a change.
+- Only the cells the compositor's damage covers are scanned. `grid` mode has no hint and scans the
+  whole grid. A scan that cannot run leaves the reported damage in place, or the whole frame when
+  there was none: it is never treated as "nothing changed".
+- Dirty cells become copy rectangles through horizontal runs inside a cell row, a vertical merge of
+  runs that share an x range, and cheapest-pair merges until the rectangle cap is reached. Every
+  rectangle is clipped to the frame. The merge is a pure function with a unit test of its own.
+- The shadow is per frame, not per destination: it answers "what did the frame look like when we
+  last scanned it", while each destination's owed set answers "what is this buffer still missing".
+  The ring stays correct because of the owed set, not because of the shadow.
+- `AQ_MSC_DAMAGE_BLINK=1` overlays the regions the copy moves with a translucent red tint, blended
+  from the real source so the picture stays readable and the regions are visible. Because the
+  destinations rotate, the regions painted last time are copied from the real source again on the
+  next write and only this frame's damage is painted; without that restore the ring would accumulate
+  red. The shadow is always updated from the real source.
+- The copy's rectangle list is the destination's owed set, so the same merge bounds it: the owed
+  strips are merged down to the cap instead of falling back to a whole frame. Cursor copies (no
+  damage, no wait fd, at most 256 px) are excluded entirely - they are a different plane and must
+  not resize the frame-sized shadow or blink image while a copy is in flight.
+- Capability failures refuse to start with the reason: a device with no compute queue, an
+  unsupported cell size, or a pipeline that cannot be created. There is no silent fallback, and a
+  pass whose fence wait times out is skipped in favour of the reported damage.
+
+### Why the scan is not gated on the size of the hint
+
+A gate like "skip the scan when the compositor reports most of the frame" looks cheap and is wrong for
+the case the pass exists for. Software that does not report damage - it repaints its whole surface
+instead - leaves the compositor no way to know which parts really changed, so the whole surface is
+reported as damaged and a large-hint gate would disable the scan exactly where it pays. The scan is
+the only thing that can tell "reported everything" from "changed everything", and its cost is accepted
+in the modes that ask for it. A frame budget too small for the scan (very high frame rates) is handled
+by leaving the mode off, not by guessing from the hint.
 
 ### The display side, failure, and teardown
 
@@ -242,10 +305,13 @@ Only a few places are touched. The essential ones:
   per-commit copy plus the skip/damage logic), `acquireSource()` / `evictIdleSources()`
   (the import cache), `allocateDestinationStorage()` / `freeDestinationStorage()`, and the
   three-slot fence and semaphore pipeline.
+- `scanInit()` / `scanRun()` / `ensureBlink()` - the grid scan and the blink overlay; the shader
+  is `scan_grid.comp` and its SPIR-V is `MSCScanGridSpirv.hpp` (generated, checked in).
 - `CMSCBuffer` - one destination buffer plus the damage it still owes (`pendingDamage`,
-  `seeded`, `markSynced`, `accumulateDamage`).
+  `seeded`, `markSynced`, `accumulateDamage`) and the blink regions it last painted.
 - `CMSCAllocator` - hands destinations to the swapchain.
-- `mscStrideFor` / `mscVkFormat` - the pure helpers, covered by a unit test.
+- `mscStrideFor` / `mscVkFormat` - the pure helpers, covered by a unit test, and `mscMergeCells`,
+  the rectangle merge, covered by `tests/ScanoutCopyDamage.cpp`.
 
 **`src/backend/drm/DRM.cpp`**
 
