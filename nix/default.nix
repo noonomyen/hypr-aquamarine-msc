@@ -16,6 +16,7 @@
   pkg-config,
   seatd,
   udev,
+  vulkan-loader,
   wayland,
   wayland-protocols,
   wayland-scanner,
@@ -66,6 +67,7 @@ customStdenv.mkDerivation {
     pixman
     seatd
     udev
+    vulkan-loader
     wayland
     wayland-protocols
     wayland-scanner
