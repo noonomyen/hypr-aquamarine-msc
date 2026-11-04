@@ -47,6 +47,35 @@ namespace Aquamarine {
         return ((width * 4 + 255) / 256) * 256;
     }
 
+    // The bpc a scanout format carries. Under MSC the destination format is the compositor's,
+    // so this is the honest ceiling for the link: a wider one would carry no more bits.
+    inline uint8_t mscBpcForFormat(uint32_t fourcc) {
+        switch (fourcc) {
+            case DRM_FORMAT_XRGB2101010:
+            case DRM_FORMAT_XBGR2101010:
+            case DRM_FORMAT_RGBX1010102:
+            case DRM_FORMAT_BGRX1010102:
+            case DRM_FORMAT_ARGB2101010:
+            case DRM_FORMAT_ABGR2101010:
+            case DRM_FORMAT_RGBA1010102:
+            case DRM_FORMAT_BGRA1010102: return 10;
+
+            case DRM_FORMAT_XRGB16161616:
+            case DRM_FORMAT_XBGR16161616:
+            case DRM_FORMAT_ARGB16161616:
+            case DRM_FORMAT_ABGR16161616:
+
+            case DRM_FORMAT_XRGB16161616F:
+            case DRM_FORMAT_XBGR16161616F:
+            case DRM_FORMAT_ARGB16161616F:
+            case DRM_FORMAT_ABGR16161616F: return 16;
+
+            case DRM_FORMAT_RGB565: return 6;
+
+            default: return 8;
+        }
+    }
+
     inline VkFormat mscVkFormat(uint32_t fourcc) {
         switch (fourcc) {
             case DRM_FORMAT_ARGB8888:

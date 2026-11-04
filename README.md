@@ -2,7 +2,7 @@
 
 A patched Aquamarine for **muxless laptops**, where the dGPU is the only usable
 renderer and the iGPU is the only path to the panel: the dGPU composes, the iGPU
-only scans out. Base: upstream `v0.15.1` - the unmodified readme is
+only scans out. Base: upstream `v0.16.0` - the unmodified readme is
 [README.aquamarine.md](README.aquamarine.md). A one-page summary of what the patch changes
 is in [PATCHES.md](PATCHES.md).
 
@@ -44,12 +44,24 @@ cmake --build ./build --parallel
 ```
 
 Hook: Hyprland has to load the built library. It keeps the upstream soname
-(`libaquamarine.so.14`), so pointing the session's `LD_LIBRARY_PATH` at the build
+(`libaquamarine.so.15`), so Hyprland must be built against these headers (v0.16.0
+changed the ABI) and pointing the session's `LD_LIBRARY_PATH` at the build
 directory is enough. For a uwsm session, in `~/.config/uwsm/env`:
 
 ```sh
 export LD_LIBRARY_PATH="$HOME/path/to/aquamarine-msc/build"
 ```
+
+Hyprland 0.57.0 turns on `quirks:skip_non_kms_dmabuf_formats` by default. That filter keeps only the
+format/modifier pairs the KMS plane can scan out, and with the renderer on one GPU and scanout on the
+other it leaves EGL clients without a usable dmabuf format: kitty, mpv and quickshell never create a
+buffer while SHM clients still work. Set it back to the opt-in value for an MSC session:
+
+```lua
+hl.config({ quirks = { skip_non_kms_dmabuf_formats = false } })
+```
+
+0.57.1 restores the opt-in default, so the line can be dropped after that upgrade.
 
 Environment. `AQ_MSC` is the switch: with it unset (or `0`) nothing below takes effect and the
 library is stock Aquamarine. With `AQ_MSC=1` every choice is explicit - there is no

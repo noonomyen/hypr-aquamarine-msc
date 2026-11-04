@@ -13,6 +13,8 @@
 
 #include <cstdlib>
 
+#include "../ScanoutCopy.hpp"
+
 using namespace Aquamarine;
 using namespace Hyprutils::Memory;
 using namespace Hyprutils::Math;
@@ -117,7 +119,7 @@ void Aquamarine::CDRMAtomicRequest::add(uint32_t id, uint32_t prop, uint64_t val
             const auto  PROP = drmModeGetProperty(backend->gpu->fd, prop);
             std::string extra;
             if (PROP && (PROP->flags & DRM_MODE_PROP_BLOB) && val) {
-                if (const auto BLOB = drmModeGetPropertyBlob(backend->gpu->fd, (uint32_t)val); BLOB) {
+                if (const auto BLOB = drmModeGetPropertyBlob(backend->gpu->fd, static_cast<uint32_t>(val)); BLOB) {
                     extra = std::format(" blobLen {}", BLOB->length);
                     drmModeFreePropertyBlob(BLOB);
                 } else
@@ -256,7 +258,10 @@ void Aquamarine::CDRMAtomicRequest::addConnector(Hyprutils::Memory::CSharedPoint
         if (connector->props.values.max_bpc && connector->maxBpcBounds.at(0) && connector->maxBpcBounds.at(1) && !connector->maxBpcFailed) {
             // max_bpc should not follow the scanout buffer format, and should instead always follow what we set in monitor specific configs.
             // even when in DS, we should not change the max_bpc to 8, as this will cause a modeset / flicker when going in / out of DS.
-            const uint64_t WANTED = STATE.maxBpc ? STATE.maxBpc : connector->maxBpcBounds.at(1);
+            // MSC has no DS and its scanout format is the compositor's buffer format, so the format's bpc
+            // is the honest ceiling there: a wider link would carry no more bits, only cost power.
+            const bool     MSC    = connector->backend && connector->backend->mscActive();
+            const uint64_t WANTED = STATE.maxBpc ? STATE.maxBpc : (MSC ? mscBpcForFormat(data.mainFB->buffer->dmabuf().format) : connector->maxBpcBounds.at(1));
             newMaxBpc             = std::clamp<uint64_t>(WANTED, connector->maxBpcBounds.at(0), connector->maxBpcBounds.at(1));
             if (forceConnProps || connector->atomic.maxBpc != newMaxBpc) {
                 add(connector->id, connector->props.values.max_bpc, newMaxBpc);

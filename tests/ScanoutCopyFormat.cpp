@@ -32,6 +32,13 @@ int main() {
     assert(Aquamarine::mscVkFormat(DRM_FORMAT_NV12) == VK_FORMAT_UNDEFINED);
     assert(Aquamarine::mscVkFormat(DRM_FORMAT_ABGR16161616F) == VK_FORMAT_UNDEFINED);
 
+    // The MSC max_bpc ceiling follows the pixel depth of the scanout format.
+    assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_XRGB8888) == 8);
+    assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_ARGB2101010) == 10);
+    assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_XRGB16161616) == 16);
+    assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_XRGB16161616F) == 16);
+    assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_RGB565) == 6);
+
     std::printf("ScanoutCopyFormat: ok\n");
     return 0;
 }

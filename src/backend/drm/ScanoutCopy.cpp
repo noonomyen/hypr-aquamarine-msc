@@ -1807,6 +1807,13 @@ bool CMSCTransfer::copy(SP<IBuffer> src, SP<IBuffer> dst, int waitFd, Hyprutils:
     if (SRCFMT == VK_FORMAT_UNDEFINED)
         return false;
 
+    // The copy is a raw image-to-buffer transfer. A destination with a different channel order or
+    // depth would be written byte for byte and scan out with wrong colours, so refuse it instead.
+    if (mscVkFormat(mscDst->dmabuf().format) != SRCFMT) {
+        log(AQ_LOG_ERROR, std::format("drm: MSC: source {:x} does not match the destination {:x}, refusing the copy", SRCDMA.format, mscDst->dmabuf().format));
+        return false;
+    }
+
     const uint32_t WIDTH  = (uint32_t)SRCDMA.size.x;
     const uint32_t HEIGHT = (uint32_t)SRCDMA.size.y;
     // The copy converts strides, so only the pixels have to line up for the damage rects to mean

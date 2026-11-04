@@ -522,6 +522,7 @@ namespace Aquamarine {
         bool     updateSecondaryRendererState(DRMFBList* retired = nullptr);
         bool     grabFormats();
         bool     shouldBlit();
+        bool     mscActive();
         void     scanConnectors();
         void     scanLeases();
         void     restoreAfterVT();
@@ -565,7 +566,7 @@ namespace Aquamarine {
         std::chrono::microseconds                                     commitLeadTime = std::chrono::microseconds{2000};
 
         Hyprutils::Memory::CSharedPointer<CDRMDumbAllocator>          dumbAllocator;
-        bool                                                          cpuCopyFallback  = false;
+        bool                                                          cpuCopyFallback = false;
 
         Hyprutils::Memory::CSharedPointer<CMSCTransfer>               msc;
         uint32_t                                                      mscAttempts      = 0;

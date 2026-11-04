@@ -953,6 +953,10 @@ bool Aquamarine::CDRMBackend::shouldBlit() {
     return primary && rendererRequired;
 }
 
+bool Aquamarine::CDRMBackend::mscActive() {
+    return shouldBlit() && mscEnabled();
+}
+
 bool Aquamarine::CDRMBackend::initMgpu() {
     if (!rendererRequired)
         return true;
@@ -2598,6 +2602,13 @@ bool Aquamarine::CDRMOutput::mscReady(SP<CMSCTransfer>& transfer, SP<CMSCAllocat
 // asks for a sync commit instead, so a reallocation cannot land behind a copy already in flight.
 SP<IBuffer> Aquamarine::CDRMOutput::mgpuNextBuffer(SP<IAllocator> allocator, SP<CSwapchain>& chain, const Hyprutils::Math::Vector2D& size, uint32_t format, bool cursor,
                                                    bool* syncRequired) {
+    // A chain built for another allocator (an MSC engine rebuild) cannot be reused. The async path
+    // has to ask for a sync commit instead of reallocating behind a copy that is already in flight.
+    if (syncRequired && chain && chain->getAllocator() != allocator) {
+        *syncRequired = true;
+        return nullptr;
+    }
+
     if (!chain || chain->getAllocator() != allocator)
         chain = CSwapchain::create(allocator, backend.lock());
 
@@ -2627,13 +2638,13 @@ SP<IBuffer> Aquamarine::CDRMOutput::mgpuNextBuffer(SP<IAllocator> allocator, SP<
     }
 
     if (!chain->reconfigure(OPTIONS)) {
-        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: could not reconfigure the destination swapchain");
+        backend->log(AQ_LOG_ERROR, "drm: could not reconfigure the destination swapchain");
         return nullptr;
     }
 
     auto next = chain->next(nullptr);
     if (!next)
-        backend->backend->log(AQ_LOG_ERROR, "drm: MSC: the destination swapchain has no buffer");
+        backend->log(AQ_LOG_ERROR, "drm: the destination swapchain has no buffer");
 
     return next;
 }
@@ -2648,7 +2659,7 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
     data.cursorVisible = cursorVisible;
 
     SP<CDRMFB> drmFB;
-    if (backend->shouldBlit() && backend->mscEnabled() && backend->primary) {
+    if (backend->mscActive()) {
         SP<CMSCTransfer>  MSC;
         SP<CMSCAllocator> MSCALLOC;
         if (!mscReady(MSC, MSCALLOC))
@@ -2689,38 +2700,9 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
             }
         }
 
-        if (!mgpu.swapchain)
-            mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
-
-        auto       options = swapchain ? swapchain->currentOptions() : mgpu.swapchain->currentOptions();
-        const auto ATTRS   = snapshot.state().buffer->dmabuf();
-        options.size       = STATE.buffer->size;
-        if (options.format == DRM_FORMAT_INVALID)
-            options.format = ATTRS.format;
-        options.multigpu = false;
-        options.cursor   = false;
-        options.scanout  = true;
-        if (options.length == 0)
-            options.length = 2;
-
-        const auto& CURRENT = mgpu.swapchain->currentOptions();
-        if (CURRENT.length > 0 &&
-            (CURRENT.length != options.length || CURRENT.size != options.size || CURRENT.format != options.format || CURRENT.multigpu != options.multigpu ||
-             CURRENT.cursor != options.cursor || CURRENT.scanout != options.scanout)) {
-            requiresSync = true;
+        auto NEW_BUFFER = mgpuNextBuffer(backend->rendererState.allocator, mgpu.swapchain, STATE.buffer->size, STATE.buffer->dmabuf().format, false, &requiresSync);
+        if (!NEW_BUFFER)
             return false;
-        }
-
-        if (!mgpu.swapchain->reconfigure(options)) {
-            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain failed reconfiguring");
-            return false;
-        }
-
-        const auto NEW_BUFFER = mgpu.swapchain->next(nullptr);
-        if (!NEW_BUFFER) {
-            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain has no buffer");
-            return false;
-        }
         mgpuAcquired = true;
 
         SP<CDRMRenderer> primaryRenderer;
@@ -2938,7 +2920,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         if (blittedFB)
             drmFB = blittedFB;
         else if (backend->shouldBlit()) {
-            if (backend->mscEnabled() && backend->primary) {
+            if (backend->mscActive()) {
                 // MSC: copy the primary buffer into a linear destination the output scans out.
                 SP<CMSCTransfer>  MSC;
                 SP<CMSCAllocator> MSCALLOC;
@@ -2964,7 +2946,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                     mgpu.loggedDstSize     = DST.size;
                     backend->backend->log(AQ_LOG_DEBUG,
                                           std::format("drm: MSC dst fb fourcc {:#x} modifier {:#x} {}x{} planes {} stride[0] {} offset[0] {}", DST.format, DST.modifier,
-                                                      (int)DST.size.x, (int)DST.size.y, DST.planes, DST.strides[0], DST.offsets[0]));
+                                                      static_cast<int>(DST.size.x), static_cast<int>(DST.size.y), DST.planes, DST.strides.at(0), DST.offsets.at(0)));
                 }
 
                 if (mscFencesDisabled()) {
@@ -3025,8 +3007,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
             if (!drmFB && EVDI && backend->dumbAllocator) {
                 if (!backend->cpuCopyFallback) {
-                    backend->backend->log(AQ_LOG_DEBUG,
-                                          std::format("drm: direct KMS import of primary buffer failed on {}, switching to dumb-buffer CPU copy", backend->gpuName));
+                    backend->backend->log(AQ_LOG_DEBUG, std::format("drm: direct KMS import of primary buffer failed on {}, switching to dumb-buffer CPU copy", backend->gpuName));
                     backend->cpuCopyFallback = true;
                 }
 
@@ -3229,7 +3210,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 
         SP<CDRMFB> fb;
 
-        if (backend->primary && backend->mscEnabled() && bufferType == eBufferType::BUFFER_TYPE_DMABUF) {
+        if (backend->mscActive() && bufferType == eBufferType::BUFFER_TYPE_DMABUF) {
             SP<CMSCTransfer>  MSC;
             SP<CMSCAllocator> MSCALLOC;
             if (!mscReady(MSC, MSCALLOC))
@@ -3254,7 +3235,7 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
             }
 
             fb = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
-        } else if (backend->primary && backend->mscEnabled()) {
+        } else if (backend->mscActive()) {
             // No blit fallback exists under MSC and a shared-memory cursor would bring the
             // display GPU's renderer back up, so refuse it instead of silently degrading.
             backend->backend->log(AQ_LOG_ERROR, "drm: MSC: only dmabuf cursors are supported, refusing the shared-memory cursor");
@@ -3278,32 +3259,12 @@ bool Aquamarine::CDRMOutput::setCursor(SP<IBuffer> buffer, const Vector2D& hotsp
 
             // TODO: will this not implode on drm_dumb?!
 
-            if (!mgpu.cursorSwapchain || mgpu.cursorSwapchain->getAllocator() != backend->rendererState.allocator) {
-                TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No cursorSwapchain for blit, creating"));
-                mgpu.cursorSwapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
-            }
-
             const auto FORMAT = bufferType == eBufferType::BUFFER_TYPE_SHM ? buffer->shm().format : buffer->dmabuf().format;
             const auto SIZE   = bufferType == eBufferType::BUFFER_TYPE_SHM ? buffer->shm().size : buffer->dmabuf().size;
 
-            auto       OPTIONS = mgpu.cursorSwapchain->currentOptions();
-            OPTIONS.multigpu   = false;
-            OPTIONS.scanout    = true;
-            OPTIONS.cursor     = true;
-            OPTIONS.format     = FORMAT;
-            OPTIONS.size       = SIZE;
-            OPTIONS.length     = 2;
-
-            if (!mgpu.cursorSwapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain failed reconfiguring");
+            auto       NEWAQBUF = mgpuNextBuffer(backend->rendererState.allocator, mgpu.cursorSwapchain, SIZE, FORMAT, true);
+            if (!NEWAQBUF)
                 return false;
-            }
-
-            auto NEWAQBUF = mgpu.cursorSwapchain->next(nullptr);
-            if (!NEWAQBUF) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu cursorSwapchain has no buffer");
-                return false;
-            }
 
             SP<Aquamarine::CDRMRenderer> primaryRenderer;
             if (backend->primary)

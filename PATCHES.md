@@ -1,6 +1,6 @@
 # Patches
 
-What this fork adds on top of upstream Aquamarine `v0.15.1`, and how it works. Everything
+What this fork adds on top of upstream Aquamarine `v0.16.0`, and how it works. Everything
 is opt-in: with `AQ_MSC` unset the library behaves like upstream. Build and run
 instructions are in [README.md](README.md).
 
@@ -16,6 +16,12 @@ iGPU is never given a renderer.
 **Damage tracking.** The copy follows the region the compositor reports as changed: a
 frame where nothing changed is skipped, a small change moves only that part, and it falls
 back to a whole frame whenever it cannot be sure. `AQ_MSC_DAMAGE=0` copies whole frames.
+
+**Link bpc follows the scanout format.** Upstream 0.16 keeps `max_bpc` at the connector
+maximum because direct scanout can change the format under it, which would mean a modeset.
+MSC never direct-scans-out and its destination format is the compositor's, so the format's
+bpc is the honest ceiling and the link is not run wider than the pixels it carries. An
+explicit `max_bpc` from the compositor still wins.
 
 **Teardown fixes.** Two crashes on exit, unrelated to the copy: a Vulkan destroy after the
 NVIDIA driver's core library had unloaded, and an EGL debug callback formatting a null
@@ -325,8 +331,9 @@ Only a few places are touched. The essential ones:
 - the commit paths `prepareAsyncCommitData()` and `commitState()`, and `setCursor()` -
   where the copy and its fence are wired in.
 
-**`src/backend/drm/Renderer.cpp`** - `eglLog()`, made null-safe.
+**`src/backend/drm/Renderer.cpp`** - `eglLog()` and `loadGLProc()`, made null-safe.
 
-**`src/backend/drm/impl/Atomic.cpp`** - commit-failure logging and the `AQ_ATOMIC_DEBUG` dump.
+**`src/backend/drm/impl/Atomic.cpp`** - commit-failure logging, the `AQ_ATOMIC_DEBUG` dump,
+and the per-format `max_bpc` ceiling used while MSC is on.
 
-**`CMakeLists.txt`** - the Vulkan dependency and the `ScanoutCopyFormat` test.
+**`CMakeLists.txt`** - the Vulkan dependency and the `ScanoutCopyFormat` / `ScanoutCopyDamage` tests.
