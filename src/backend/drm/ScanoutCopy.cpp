@@ -307,7 +307,8 @@ struct CMSCTransfer::SImpl {
 
     // Grid damage scan (AQ_MSC_DAMAGE=compositor+grid|grid). The scan runs on a compute queue,
     // the copy stays on the family picked for it, and the two are ordered by the host: the scan's
-    // result has to be back before the copy can be recorded.
+    // result has to be back before the copy can be recorded. One pipeline per pixel depth, so the
+    // 8-bit scan never pays for 10-bit support and the other way round.
     uint32_t              scanFamily   = UINT32_MAX;
     VkQueue               scanQueue    = VK_NULL_HANDLE;
     VkCommandPool         scanPool     = VK_NULL_HANDLE;
@@ -317,11 +318,12 @@ struct CMSCTransfer::SImpl {
     VkSampler             scanSampler  = VK_NULL_HANDLE;
     bool                  scanGuard    = false;
 
-    VkDescriptorSetLayout scanDSL      = VK_NULL_HANDLE;
-    VkDescriptorPool      scanDPool    = VK_NULL_HANDLE;
-    VkDescriptorSet       scanDS       = VK_NULL_HANDLE;
-    VkPipelineLayout      scanLayout   = VK_NULL_HANDLE;
-    VkPipeline            scanPipeline = VK_NULL_HANDLE;
+    VkDescriptorSetLayout scanDSL    = VK_NULL_HANDLE;
+    VkDescriptorPool      scanDPool  = VK_NULL_HANDLE;
+    VkDescriptorSet       scanDS     = VK_NULL_HANDLE;
+    VkPipelineLayout      scanLayout = VK_NULL_HANDLE;
+    VkPipeline            scanPipe8  = VK_NULL_HANDLE;
+    VkPipeline            scanPipe10 = VK_NULL_HANDLE;
 
     VkImage               shadow     = VK_NULL_HANDLE;
     VkDeviceMemory        shadowMem  = VK_NULL_HANDLE;
@@ -981,9 +983,13 @@ void CMSCTransfer::scanDestroy() {
     if (!DEV)
         return;
 
-    if (m_impl->scanPipeline) {
-        vkDestroyPipeline(DEV, m_impl->scanPipeline, nullptr);
-        m_impl->scanPipeline = VK_NULL_HANDLE;
+    if (m_impl->scanPipe8) {
+        vkDestroyPipeline(DEV, m_impl->scanPipe8, nullptr);
+        m_impl->scanPipe8 = VK_NULL_HANDLE;
+    }
+    if (m_impl->scanPipe10) {
+        vkDestroyPipeline(DEV, m_impl->scanPipe10, nullptr);
+        m_impl->scanPipe10 = VK_NULL_HANDLE;
     }
     if (m_impl->scanLayout) {
         vkDestroyPipelineLayout(DEV, m_impl->scanLayout, nullptr);
@@ -1064,12 +1070,7 @@ void CMSCTransfer::scanDestroy() {
 }
 
 bool CMSCTransfer::scanInit() {
-    const VkDevice           DEV = m_impl->device;
-
-    VkShaderModuleCreateInfo sInfo  = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof(MSC_SCAN_GRID_SPIRV), .pCode = MSC_SCAN_GRID_SPIRV};
-    VkShaderModule           module = VK_NULL_HANDLE;
-    if (!checkResult(vkCreateShaderModule(DEV, &sInfo, nullptr, &module), "creating the grid scan shader"))
-        return false;
+    const VkDevice               DEV = m_impl->device;
 
     VkSamplerCreateInfo          samp = {.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                                          .magFilter    = VK_FILTER_NEAREST,
@@ -1089,11 +1090,10 @@ bool CMSCTransfer::scanInit() {
     VkPushConstantRange             range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 6 * sizeof(uint32_t)};
     VkPipelineLayoutCreateInfo      pl    = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &m_impl->scanDSL, .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
-    VkComputePipelineCreateInfo cp = {
-        .sType              = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage              = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"},
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex  = -1};
+    VkComputePipelineCreateInfo cp       = {.sType              = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                            .stage              = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main"},
+                                            .basePipelineHandle = VK_NULL_HANDLE,
+                                            .basePipelineIndex  = -1};
     VkDescriptorPoolSize        sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
     VkDescriptorPoolCreateInfo  dpi      = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = sizes};
     VkDescriptorSetAllocateInfo dsai     = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 1, .pSetLayouts = &m_impl->scanDSL};
@@ -1120,9 +1120,21 @@ bool CMSCTransfer::scanInit() {
     bool ok = OK;
     if (ok) {
         cp.layout = m_impl->scanLayout;
-        ok        = checkResult(vkCreateComputePipelines(DEV, VK_NULL_HANDLE, 1, &cp, nullptr, &m_impl->scanPipeline), "creating the grid scan pipeline");
+        // Both pipelines are built here rather than on first use: one built from the commit path
+        // would stall the frame that switches depth.
+        const auto BUILD = [&](const uint32_t* code, size_t bytes, VkPipeline& pipe, const char* what) {
+            VkShaderModuleCreateInfo si  = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = code};
+            VkShaderModule           mod = VK_NULL_HANDLE;
+            if (!checkResult(vkCreateShaderModule(DEV, &si, nullptr, &mod), what))
+                return false;
+            cp.stage.module   = mod;
+            const bool PIPEOK = checkResult(vkCreateComputePipelines(DEV, VK_NULL_HANDLE, 1, &cp, nullptr, &pipe), what);
+            vkDestroyShaderModule(DEV, mod, nullptr);
+            return PIPEOK;
+        };
+        ok = BUILD(MSC_SCAN_GRID_SPIRV, sizeof(MSC_SCAN_GRID_SPIRV), m_impl->scanPipe8, "creating the grid scan pipeline") &&
+            BUILD(MSC_SCAN_GRID_SPIRV_10, sizeof(MSC_SCAN_GRID_SPIRV_10), m_impl->scanPipe10, "creating the 10-bit grid scan pipeline");
     }
-    vkDestroyShaderModule(DEV, module, nullptr);
     if (!ok) {
         scanDestroy();
         return false;
@@ -1132,7 +1144,10 @@ bool CMSCTransfer::scanInit() {
 
 bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t width, uint32_t height, uint32_t fourcc, VkImage srcImage, VkImageView srcView, int waitFd,
                                bool& waitedOnProducer) {
-    if (!m_impl->scanPipeline || !srcImage || !srcView)
+    // Blink always runs the 8-bit pipeline: its frame is a byte-encoded RGBA8 image whose texels
+    // the copy moves raw, so the tint is packed for the destination in the shader regardless of
+    // the source's depth.
+    if (!m_impl->scanPipe8 || !srcImage || !srcView)
         return false;
 
     const VkDevice DEV = m_impl->device;
@@ -1383,7 +1398,7 @@ bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t w
     };
     vkCmdPipelineBarrier(m_impl->scanCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 2, acquires);
 
-    vkCmdBindPipeline(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanPipeline);
+    vkCmdBindPipeline(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanPipe8);
     vkCmdBindDescriptorSets(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanLayout, 0, 1, &m_impl->scanDS, 0, nullptr);
     const uint32_t push[6] = {CELL, COLS, ROWS, blinkMode, width, height};
     vkCmdPushConstants(m_impl->scanCmd, m_impl->scanLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
@@ -1460,6 +1475,14 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
     const uint32_t     ROWS  = (height + CELL - 1) / CELL;
     const VkDeviceSize DIRTY = (VkDeviceSize)COLS * (VkDeviceSize)ROWS * sizeof(uint32_t);
 
+    // The shadow and the pipeline both follow the source's pixel depth: the 8-bit scan compares
+    // bytes, the 10-bit one compares packed words. A depth with no shadow representation leaves
+    // the reported damage untouched instead of comparing at the wrong precision.
+    const VkFormat SHADOWFMT = mscShadowFormat(fourcc);
+    if (SHADOWFMT == VK_FORMAT_UNDEFINED)
+        return false;
+    const bool TENBIT = SHADOWFMT == VK_FORMAT_R32_UINT;
+
     // The shadow is the frame we scanned last. It is (re)created with the frame and starts out
     // "fresh": the first scan stores the source without comparing, so it can never miss a change.
     if (m_impl->shadowW != width || m_impl->shadowH != height || m_impl->shadowFourcc != fourcc) {
@@ -1484,7 +1507,7 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
 
         VkImageCreateInfo ci = {.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                                 .imageType     = VK_IMAGE_TYPE_2D,
-                                .format        = VK_FORMAT_R8G8B8A8_UNORM,
+                                .format        = SHADOWFMT,
                                 .extent        = {width, height, 1},
                                 .mipLevels     = 1,
                                 .arrayLayers   = 1,
@@ -1518,7 +1541,7 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
         VkImageViewCreateInfo vi = {.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                                     .image            = m_impl->shadow,
                                     .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-                                    .format           = VK_FORMAT_R8G8B8A8_UNORM,
+                                    .format           = SHADOWFMT,
                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         if (!checkResult(vkCreateImageView(DEV, &vi, nullptr, &m_impl->shadowView), "creating the damage shadow view"))
             return false;
@@ -1696,7 +1719,7 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
     vkCmdPipelineBarrier(m_impl->scanCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                          2, acquires);
 
-    vkCmdBindPipeline(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanPipeline);
+    vkCmdBindPipeline(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, TENBIT ? m_impl->scanPipe10 : m_impl->scanPipe8);
     vkCmdBindDescriptorSets(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanLayout, 0, 1, &m_impl->scanDS, 0, nullptr);
     const uint32_t push[6] = {CELL, COLS, ROWS, m_impl->shadowFresh ? 1u : 0u, width, height};
     vkCmdPushConstants(m_impl->scanCmd, m_impl->scanLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);

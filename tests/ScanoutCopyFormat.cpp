@@ -39,6 +39,17 @@ int main() {
     assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_XRGB16161616F) == 16);
     assert(Aquamarine::mscBpcForFormat(DRM_FORMAT_RGB565) == 6);
 
+    // The grid scan's shadow follows the depth as well: bytes for 8-bit, one packed word for
+    // 10-bit, and no shadow for a format the copy path does not carry.
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_XRGB8888) == VK_FORMAT_R8G8B8A8_UNORM);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_XBGR8888) == VK_FORMAT_R8G8B8A8_UNORM);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_XRGB2101010) == VK_FORMAT_R32_UINT);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_ABGR2101010) == VK_FORMAT_R32_UINT);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_RGBX1010102) == VK_FORMAT_UNDEFINED);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_XRGB16161616F) == VK_FORMAT_UNDEFINED);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_NV12) == VK_FORMAT_UNDEFINED);
+    assert(Aquamarine::mscShadowFormat(DRM_FORMAT_RGB565) == VK_FORMAT_UNDEFINED);
+
     std::printf("ScanoutCopyFormat: ok\n");
     return 0;
 }

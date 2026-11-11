@@ -90,6 +90,20 @@ namespace Aquamarine {
         }
     }
 
+    // The grid scan's shadow format. One representation per depth so neither path pays for the
+    // other, and only for the formats the copy itself carries: 8-bit keeps the byte shadow its
+    // compare was built on, 10-bit gets a packed word per pixel so the compare sees every bit the
+    // scanout displays. A format the copy refuses has no shadow either.
+    inline VkFormat mscShadowFormat(uint32_t fourcc) {
+        switch (mscVkFormat(fourcc)) {
+            case VK_FORMAT_B8G8R8A8_UNORM:
+            case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+            case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_R32_UINT;
+            default: return VK_FORMAT_UNDEFINED;
+        }
+    }
+
     struct SMSCDamageRect {
         int32_t x = 0, y = 0, w = 0, h = 0;
     };

@@ -80,7 +80,7 @@ in the log:
 | `AQ_MSC_DAMAGE_BLINK` | no | unset \| `1` | debug: paint the regions the copy decided to move with a translucent red overlay, so the damage logic is visible on screen. It corrupts the picture by design and does nothing when unset. |
 | `AQ_MSC_STATS` | no | seconds (default `60`) \| `0` | how often the engine logs its counters (copies, waits, damage distribution, why frames were copied whole); `0` turns the reports off. A negative or unparsable value also turns them off, silently. |
 
-The grid modes read the frame on the compose GPU and run on a compute queue of that GPU, so they cost memory bandwidth and share the GPU with the compositor's rendering. They pay off when the reported damage is much larger than what actually changed - a capture, or software that does not report damage and repaints its whole surface, which is also why there is no hint-size gate: gating on a large hint would switch the scan off exactly for those clients. They add cost when the damage was already tight or the frame budget is tiny (very high frame rates), so the mode is opt-in and the cell size is the tuning knob.
+The grid modes read the frame on the compose GPU and run on a compute queue of that GPU, so they cost memory bandwidth and share the GPU with the compositor's rendering. They pay off when the reported damage is much larger than what actually changed - a capture, or software that does not report damage and repaints its whole surface, which is also why there is no hint-size gate: gating on a large hint would switch the scan off exactly for those clients. They add cost when the damage was already tight or the frame budget is tiny (very high frame rates), so the mode is opt-in and the cell size is the tuning knob. The compare runs at the depth of the scanout format - bytes for 8-bit, packed words for 10-bit - so on a 10-bit output it sees 1 LSB changes and therefore saves less on dithered or banded content than it does on 8-bit.
 
 Debug only:
 
@@ -124,7 +124,9 @@ the pointer is then composited into the frame.
 - the grid modes add a scan per frame, so on a frame budget that is already tight (very high
   frame rates) the scan can cost more than the copy it saves;
 - a second output on the display GPU is untested;
-- HDR / 10-bit, scaled modes and multi-GPU output are untested;
+- 10-bit scanout is handled end to end, grid scan included. 16-bit float HDR is not: the copy
+  path carries only the 32-bit formats, so a 16-bit source is refused and its commits fail. Scaled
+  modes and multi-GPU output are untested;
 - there is no fallback: if the copy cannot be built, or the requested queue is not
   available, the session refuses to start and the log says why;
 - Vulkan is linked unconditionally, so `libvulkan` is loaded even with `AQ_MSC` off.

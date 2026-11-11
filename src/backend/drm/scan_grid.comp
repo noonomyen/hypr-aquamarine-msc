@@ -5,12 +5,23 @@
 // Cells outside the candidate rectangles are never looked at: the compositor's damage is a superset
 // of what changed, so the copy that follows can trust the result.
 //
-// The alpha channel is not compared: a source the compositor produced as XRGB8 carries no meaning
-// in that byte, and comparing it would mark cells dirty that did not change.
+// The alpha channel is not compared: the scanout does not blend, so an alpha-only change is not a
+// change on screen, and for an XRGB source the byte carries nothing at all.
+//
+// The shadow is as deep as the scanout: MSC_10BIT builds the same pass with a packed-word shadow
+// and a bit-exact compare at 10 bits, while the default 8-bit build keeps the byte shadow. The tint
+// modes (fresh >= 2) exist only in the 8-bit build; the blink frame always runs that pipeline.
 layout(local_size_x = 64) in;
 
 layout(binding = 0) uniform sampler2D srcImg;
+#ifdef MSC_10BIT
+// 10-bit scanout: the copy moves 32-bit words, so the shadow holds the colour channels packed at
+// 10 bits each and the compare sees every bit the scanout displays. Alpha is not compared: the
+// primary plane does not blend, so an alpha-only change is not a change on screen.
+layout(binding = 1, r32ui) uniform uimage2D shadowImg;
+#else
 layout(binding = 1, rgba8) uniform image2D shadowImg;
+#endif
 layout(binding = 2, std430) buffer Dirty {
     uint dirty[];
 }
@@ -31,6 +42,12 @@ layout(push_constant) uniform Params {
 p;
 
 shared uint s_any[64];
+
+#ifdef MSC_10BIT
+uint pack10(const vec4 c) {
+    return (uint(round(c.r * 1023.0)) << 20) | (uint(round(c.g * 1023.0)) << 10) | uint(round(c.b * 1023.0));
+}
+#endif
 
 void main() {
     const uint wg = gl_WorkGroupID.x;
@@ -66,6 +83,13 @@ void main() {
         if (pos.x >= int(p.frameW) || pos.y >= int(p.frameH))
             continue;
         const vec4 cur = texelFetch(srcImg, pos, 0);
+#ifdef MSC_10BIT
+        const uint word = pack10(cur);
+        if (p.fresh != 0u || imageLoad(shadowImg, pos).x != word) {
+            imageStore(shadowImg, pos, uvec4(word, 0u, 0u, 0u));
+            changed = 1u;
+        }
+#else
         if (p.fresh >= 2u) {
             const vec3 b = mix(cur.rgb, vec3(1.0, 0.0, 0.0), 0.35);
             if (p.fresh == 2u)
@@ -92,9 +116,12 @@ void main() {
             imageStore(shadowImg, pos, cur);
             changed = 1u;
         }
+#endif
     }
+#ifndef MSC_10BIT
     if (p.fresh >= 2u)
         return;
+#endif
 
     s_any[gl_LocalInvocationID.x] = changed;
     barrier();

@@ -246,11 +246,14 @@ The copy can check the reported damage against the pixels before it records anyt
   given. The host orders the two - the dirty map has to be back before the copy can be recorded -
   so no semaphore crosses the queues, but the source image is acquired for the scan family and
   released back to the foreign family before the copy acquires it for its own.
-- The shadow is a device-local image of the frame's size and format. One workgroup per cell
-  compares the source against it with raw texel values (the alpha channel is ignored: an XRGB source
-  carries nothing there), stores the differing pixels back into the shadow and sets the cell's dirty
-  word. The first scan after the shadow is created stores the source instead of comparing, so a
-  fresh shadow can never hide a change.
+- The shadow is a device-local image of the frame's size, at the depth of the frame's format: RGBA8
+  for 8-bit frames, one packed word per pixel for 10-bit ones, with a pipeline per depth so neither
+  scan pays for the other. One workgroup per cell compares the source against it with raw texel
+  values (alpha is not compared: the primary plane does not blend, so an alpha-only change is not a
+  change on screen), stores the differing pixels back into the shadow and sets the cell's dirty
+  word. The compare sees the bits the scanout displays, so on a 10-bit output a 1 LSB change marks
+  its cell dirty. The first scan after the shadow is created stores the source instead of comparing,
+  so a fresh shadow can never hide a change.
 - Only the cells the compositor's damage covers are scanned. `grid` mode has no hint and scans the
   whole grid. A scan that cannot run leaves the reported damage in place, or the whole frame when
   there was none: it is never treated as "nothing changed".
@@ -316,8 +319,9 @@ Only a few places are touched. The essential ones:
 - `CMSCBuffer` - one destination buffer plus the damage it still owes (`pendingDamage`,
   `seeded`, `markSynced`, `accumulateDamage`) and the blink regions it last painted.
 - `CMSCAllocator` - hands destinations to the swapchain.
-- `mscStrideFor` / `mscVkFormat` - the pure helpers, covered by a unit test, and `mscMergeCells`,
-  the rectangle merge, covered by `tests/ScanoutCopyDamage.cpp`.
+- `mscStrideFor` / `mscVkFormat` / `mscBpcForFormat` / `mscShadowFormat` - the pure helpers,
+  covered by a unit test, and `mscMergeCells`, the rectangle merge, covered by
+  `tests/ScanoutCopyDamage.cpp`.
 
 **`src/backend/drm/DRM.cpp`**
 
