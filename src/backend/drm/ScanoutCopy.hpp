@@ -204,7 +204,9 @@ namespace Aquamarine {
         std::unique_ptr<SImpl>                       m_impl;
         Hyprutils::Memory::CWeakPointer<CDRMBackend> m_primary;
         Hyprutils::Memory::CWeakPointer<CBackend>    m_backend; // log target
-        bool                                         m_bad = true;
+        // Fail-closed until the constructor has a working copy engine: it clears this only when
+        // every copy object exists, and sets it again if the optional scan cannot be built.
+        bool m_bad = true;
     };
 
     class CMSCBuffer : public IBuffer {

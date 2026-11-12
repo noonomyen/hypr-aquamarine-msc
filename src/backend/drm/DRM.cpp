@@ -467,7 +467,9 @@ std::vector<SP<CDRMBackend>> Aquamarine::CDRMBackend::attempt(SP<CBackend> backe
     // configuration error: fail the scan so the session refuses to start instead of coming
     // up with every output black.
     if (newPrimary && newPrimary->mscEnabled() && !newPrimary->mscTransfer()) {
-        backend->log(AQ_LOG_ERROR, "drm: MSC: the copy engine could not be built, refusing to start");
+        backend->log(AQ_LOG_ERROR,
+                     "drm: MSC: the copy engine could not be built, refusing to start (set AQ_MSC_DAMAGE=compositor and unset AQ_MSC_DAMAGE_BLINK to "
+                     "start without the grid scan, or AQ_MSC=0)");
         return {};
     }
 

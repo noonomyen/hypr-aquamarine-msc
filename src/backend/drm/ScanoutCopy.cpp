@@ -616,7 +616,9 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
             m_impl->timestampMask    = VALIDBITS >= 64 ? ~0ull : ((1ull << VALIDBITS) - 1);
         }
         if (m_impl->scanFamily == UINT32_MAX) {
-            log(AQ_LOG_ERROR, "drm: MSC: AQ_MSC_DAMAGE/BLINK needs a compute queue, and this device has none; refusing to start");
+            log(AQ_LOG_ERROR,
+                "drm: MSC: AQ_MSC_DAMAGE/BLINK needs a compute queue, and this device has none; refusing to start (set AQ_MSC_DAMAGE=compositor and "
+                "unset AQ_MSC_DAMAGE_BLINK, or AQ_MSC=0)");
             return;
         }
 
@@ -701,12 +703,17 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     vkGetPhysicalDeviceMemoryProperties(m_impl->physical, &m_impl->memProps);
 
     m_impl->scanGuard = NEEDCS;
+    // Everything the copy needs exists here, so the engine counts as good from this point. The
+    // scan is built last and marks the engine bad again if it cannot be: that way every failure
+    // above leaves the flag at its fail-closed default, and nothing late reads a half-built state.
+    m_bad = false;
     if (NEEDCS && !scanInit()) {
-        fprintf(stderr, "MSC: the grid damage pass could not be created; refusing to start\n");
+        m_bad = true;
+        fprintf(stderr,
+                "MSC: the grid damage pass could not be created; refusing to start (set AQ_MSC_DAMAGE=compositor and unset "
+                "AQ_MSC_DAMAGE_BLINK to start without it)\n");
         return;
     }
-
-    m_bad = false;
 }
 
 CMSCTransfer::~CMSCTransfer() {
@@ -1011,6 +1018,8 @@ void CMSCTransfer::scanDestroy() {
         vkDestroyDescriptorPool(DEV, m_impl->scanDPool, nullptr);
         m_impl->scanDPool = VK_NULL_HANDLE;
         m_impl->scanDS    = VK_NULL_HANDLE;
+        // The set is gone: any later scan must write every binding before it binds it.
+        m_impl->scanDescDirty = true;
     }
     if (m_impl->scanDSL) {
         vkDestroyDescriptorSetLayout(DEV, m_impl->scanDSL, nullptr);
@@ -1154,11 +1163,17 @@ bool CMSCTransfer::scanInit() {
     // The timestamp pair only feeds the counters, so counters off means no pool to pay for. A
     // family without timestamp support keeps the wall timer alone.
     if (ok && MSC_STATS_SECONDS > 0 && m_impl->timestampMask) {
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
-        if (!checkResult(vkCreateQueryPool(DEV, &qi, nullptr, &m_impl->scanQPool), "creating the scan timestamp pool"))
+        VkQueryPoolCreateInfo qi   = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+        const VkResult        POOL = vkCreateQueryPool(DEV, &qi, nullptr, &m_impl->scanQPool);
+        if (POOL != VK_SUCCESS) {
             m_impl->scanQPool = VK_NULL_HANDLE;
+            checkResult(POOL, "creating the scan timestamp pool");
+            // Instrumentation must not fail the engine, but a lost device must reach the caller.
+            if (POOL == VK_ERROR_DEVICE_LOST)
+                ok = false;
+        }
     }
-    if (!ok || m_bad) {
+    if (!ok) {
         scanDestroy();
         return false;
     }
