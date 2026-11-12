@@ -104,6 +104,35 @@ namespace Aquamarine {
         }
     }
 
+    // The family the scan runs on: a compute family without the graphics engine first, so the scan
+    // does not compete with the compositor's renderer, and any compute family as the fallback.
+    inline uint32_t mscPickScanFamily(const VkQueueFamilyProperties* families, uint32_t count) {
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            for (uint32_t i = 0; i < count; ++i) {
+                if (!families[i].queueCount || !(families[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                    continue;
+                if (pass == 0 && (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+                    continue;
+                return i;
+            }
+        }
+        return UINT32_MAX;
+    }
+
+    // A host-visible memory type for the scan's readback buffers, cached preferred: the dirty map
+    // is read word by word on the CPU, and the write-combined type costs an uncached read per word.
+    // The fallback keeps the buffers coherent, which the read path relies on.
+    inline uint32_t mscHostMemoryType(const VkPhysicalDeviceMemoryProperties& memProps, uint32_t bits) {
+        for (const VkMemoryPropertyFlags REQUIRED : {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT}) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((bits & (1u << i)) && ((memProps.memoryTypes[i].propertyFlags & REQUIRED) == REQUIRED))
+                    return i;
+            }
+        }
+        return UINT32_MAX;
+    }
+
     struct SMSCDamageRect {
         int32_t x = 0, y = 0, w = 0, h = 0;
     };

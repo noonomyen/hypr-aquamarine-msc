@@ -242,10 +242,14 @@ reports off.
 The copy can check the reported damage against the pixels before it records anything. `compositor` (the default) keeps the reported damage without the scan; `compositor+grid` adds the scan.
 
 - The scan runs on a compute queue of its own: a second queue from the compute-capable family, or
-  a second queue from the copy family when the two are the same. The copy keeps the family it was
-  given. The host orders the two - the dirty map has to be back before the copy can be recorded -
-  so no semaphore crosses the queues, but the source image is acquired for the scan family and
-  released back to the foreign family before the copy acquires it for its own.
+  a second queue from the copy family when the two are the same. A family without the graphics
+  engine is preferred, so the scan does not share the renderer's engine; a device whose only
+  compute family is the graphics one still works. The copy keeps the family it was given. The host
+  orders the two - the dirty map has to be back before the copy can be recorded - so no semaphore
+  crosses the queues, but the source image is acquired for the scan family and released back to the
+  foreign family before the copy acquires it for its own. The dirty map lives in host-visible
+  memory that is cached when the driver offers it: the CPU reads it word by word, which the
+  write-combined type turns into one uncached read per word.
 - The shadow is a device-local image of the frame's size, at the depth of the frame's format: RGBA8
   for 8-bit frames, one packed word per pixel for 10-bit ones, with a pipeline per depth so neither
   scan pays for the other. One workgroup per cell compares the source against it with raw texel

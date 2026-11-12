@@ -349,6 +349,13 @@ struct CMSCTransfer::SImpl {
     uint32_t              cellSize = 64;
 
     uint64_t              scanFrames = 0, scanCells = 0, scanDirtyCells = 0, scanNs = 0;
+
+    // Bindings 1..3 change only when the shadow, the readback buffers or the blink frame are
+    // recreated, so the per-frame path rewrites binding 0 and the rest only when this says they
+    // are stale.
+    bool scanDescDirty = true;
+    // Read once: the dispatch guard needs the workgroup limit every frame, the device is fixed.
+    uint32_t maxScanWorkGroups = 0;
 };
 
 std::vector<Aquamarine::SMSCDamageRect> Aquamarine::mscMergeCells(const std::vector<SMSCDamageRect>& cells, uint32_t cap, uint32_t frameW, uint32_t frameH) {
@@ -549,6 +556,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(m_impl->physical, &props);
         log(AQ_LOG_DEBUG, std::format("drm: MSC: copy engine {} (vendor 0x{:x}) on render node {}:{}", props.deviceName, props.vendorID, TARGETMAJOR, TARGETMINOR));
+        m_impl->maxScanWorkGroups = props.limits.maxComputeWorkGroupCount[0];
     }
 
     // AQ_MSC_QUEUE picks the family the copy is submitted to: transfer asks for the async
@@ -597,12 +605,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     // its own family; the compute pass gets a queue of its own so the two can overlap. Asking for a
     // mode the device cannot run refuses to start, the same way an unavailable copy family does.
     if (NEEDCS) {
-        for (uint32_t i = 0; i < count; ++i) {
-            if (families[i].queueCount && (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
-                m_impl->scanFamily = i;
-                break;
-            }
-        }
+        m_impl->scanFamily = mscPickScanFamily(families, count);
         if (m_impl->scanFamily == UINT32_MAX) {
             log(AQ_LOG_ERROR, "drm: MSC: AQ_MSC_DAMAGE/BLINK needs a compute queue, and this device has none; refusing to start");
             return;
@@ -1161,6 +1164,8 @@ bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t w
     }
 
     if (!m_impl->blinkImage || m_impl->blinkW != width || m_impl->blinkH != height || m_impl->blinkFourcc != fourcc) {
+        // The bound view is gone before any of the steps below can fail, so the flag goes up here.
+        m_impl->scanDescDirty = true;
         if (m_impl->blinkView) {
             vkDestroyImageView(DEV, m_impl->blinkView, nullptr);
             m_impl->blinkView = VK_NULL_HANDLE;
@@ -1259,22 +1264,17 @@ bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t w
             return false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(DEV, buf, &req);
-        uint32_t type = UINT32_MAX;
-        for (uint32_t i = 0; i < m_impl->memProps.memoryTypeCount; ++i) {
-            const auto FLAGS = m_impl->memProps.memoryTypes[i].propertyFlags;
-            if ((req.memoryTypeBits & (1u << i)) && (FLAGS & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (FLAGS & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                type = i;
-                break;
-            }
-        }
-        if (type == UINT32_MAX)
+        const uint32_t TYPE = mscHostMemoryType(m_impl->memProps, req.memoryTypeBits);
+        if (TYPE == UINT32_MAX)
             return false;
-        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = TYPE};
         if (vkAllocateMemory(DEV, &ai, nullptr, &mem) != VK_SUCCESS || vkBindBufferMemory(DEV, buf, mem, 0) != VK_SUCCESS)
             return false;
         if (vkMapMemory(DEV, mem, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS)
             return false;
         have = bytes;
+
+        m_impl->scanDescDirty = true;
         return true;
     };
     if (!HOSTBUFFER(m_impl->scanDirty, m_impl->scanDirtyMem, m_impl->scanDirtyPtr, DIRTY, m_impl->scanDirtySize))
@@ -1370,6 +1370,8 @@ bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t w
          .pBufferInfo     = &candInfo},
     };
     vkUpdateDescriptorSets(DEV, 4, writes, 0, nullptr);
+    // Blink takes binding 1 for its own frame, so the next scan has to put the shadow view back.
+    m_impl->scanDescDirty = true;
 
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (!checkResult(vkResetCommandBuffer(m_impl->scanCmd, 0), "resetting the blink command buffer") ||
@@ -1402,9 +1404,7 @@ bool CMSCTransfer::ensureBlink(const Hyprutils::Math::CRegion& paint, uint32_t w
     vkCmdBindDescriptorSets(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanLayout, 0, 1, &m_impl->scanDS, 0, nullptr);
     const uint32_t push[6] = {CELL, COLS, ROWS, blinkMode, width, height};
     vkCmdPushConstants(m_impl->scanCmd, m_impl->scanLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-    VkPhysicalDeviceProperties SCANPROPS;
-    vkGetPhysicalDeviceProperties(m_impl->physical, &SCANPROPS);
-    if (total > SCANPROPS.limits.maxComputeWorkGroupCount[0]) {
+    if (total > m_impl->maxScanWorkGroups) {
         log(AQ_LOG_DEBUG, "drm: MSC: the grid exceeds one dispatch; skipping the pass on this frame");
         return false;
     }
@@ -1492,6 +1492,8 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
                     return false;
             }
         }
+        // The bound view is gone before any of the steps below can fail, so the flag goes up here.
+        m_impl->scanDescDirty = true;
         if (m_impl->shadowView) {
             vkDestroyImageView(DEV, m_impl->shadowView, nullptr);
             m_impl->shadowView = VK_NULL_HANDLE;
@@ -1571,22 +1573,17 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
             return false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(DEV, buf, &req);
-        uint32_t type = UINT32_MAX;
-        for (uint32_t i = 0; i < m_impl->memProps.memoryTypeCount; ++i) {
-            const auto FLAGS = m_impl->memProps.memoryTypes[i].propertyFlags;
-            if ((req.memoryTypeBits & (1u << i)) && (FLAGS & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (FLAGS & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                type = i;
-                break;
-            }
-        }
-        if (type == UINT32_MAX)
+        const uint32_t TYPE = mscHostMemoryType(m_impl->memProps, req.memoryTypeBits);
+        if (TYPE == UINT32_MAX)
             return false;
-        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = TYPE};
         if (vkAllocateMemory(DEV, &ai, nullptr, &mem) != VK_SUCCESS || vkBindBufferMemory(DEV, buf, mem, 0) != VK_SUCCESS)
             return false;
         if (vkMapMemory(DEV, mem, 0, VK_WHOLE_SIZE, 0, &ptr) != VK_SUCCESS)
             return false;
         have = bytes;
+
+        m_impl->scanDescDirty = true;
         return true;
     };
     if (!HOSTBUFFER(m_impl->scanDirty, m_impl->scanDirtyMem, m_impl->scanDirtyPtr, DIRTY, m_impl->scanDirtySize))
@@ -1689,7 +1686,8 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
          .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
          .pBufferInfo     = &candInfo},
     };
-    vkUpdateDescriptorSets(DEV, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(DEV, m_impl->scanDescDirty ? 4u : 1u, writes, 0, nullptr);
+    m_impl->scanDescDirty = false;
 
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (!checkResult(vkResetCommandBuffer(m_impl->scanCmd, 0), "resetting the grid scan command buffer") ||
@@ -1723,9 +1721,7 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
     vkCmdBindDescriptorSets(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanLayout, 0, 1, &m_impl->scanDS, 0, nullptr);
     const uint32_t push[6] = {CELL, COLS, ROWS, m_impl->shadowFresh ? 1u : 0u, width, height};
     vkCmdPushConstants(m_impl->scanCmd, m_impl->scanLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
-    VkPhysicalDeviceProperties SCANPROPS;
-    vkGetPhysicalDeviceProperties(m_impl->physical, &SCANPROPS);
-    if (total > SCANPROPS.limits.maxComputeWorkGroupCount[0]) {
+    if (total > m_impl->maxScanWorkGroups) {
         log(AQ_LOG_DEBUG, "drm: MSC: the grid exceeds one dispatch; skipping the pass on this frame");
         return false;
     }
