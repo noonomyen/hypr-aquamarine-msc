@@ -315,6 +315,7 @@ struct CMSCTransfer::SImpl {
     VkCommandBuffer       scanCmd      = VK_NULL_HANDLE;
     VkFence               scanFence    = VK_NULL_HANDLE;
     VkSemaphore           scanIncoming = VK_NULL_HANDLE;
+    VkQueryPool           scanQPool    = VK_NULL_HANDLE;
     VkSampler             scanSampler  = VK_NULL_HANDLE;
     bool                  scanGuard    = false;
 
@@ -348,7 +349,7 @@ struct CMSCTransfer::SImpl {
 
     uint32_t              cellSize = 64;
 
-    uint64_t              scanFrames = 0, scanCells = 0, scanDirtyCells = 0, scanNs = 0;
+    uint64_t              scanFrames = 0, scanCells = 0, scanDirtyCells = 0, scanNs = 0, scanGpuNs = 0;
 
     // Bindings 1..3 change only when the shadow, the readback buffers or the blink frame are
     // recreated, so the per-frame path rewrites binding 0 and the rest only when this says they
@@ -356,6 +357,8 @@ struct CMSCTransfer::SImpl {
     bool scanDescDirty = true;
     // Read once: the dispatch guard needs the workgroup limit every frame, the device is fixed.
     uint32_t maxScanWorkGroups = 0;
+    double   timestampPeriod   = 0.0;
+    uint64_t timestampMask     = 0;
 };
 
 std::vector<Aquamarine::SMSCDamageRect> Aquamarine::mscMergeCells(const std::vector<SMSCDamageRect>& cells, uint32_t cap, uint32_t frameW, uint32_t frameH) {
@@ -557,6 +560,7 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
         vkGetPhysicalDeviceProperties(m_impl->physical, &props);
         log(AQ_LOG_DEBUG, std::format("drm: MSC: copy engine {} (vendor 0x{:x}) on render node {}:{}", props.deviceName, props.vendorID, TARGETMAJOR, TARGETMINOR));
         m_impl->maxScanWorkGroups = props.limits.maxComputeWorkGroupCount[0];
+        m_impl->timestampPeriod   = props.limits.timestampPeriod;
     }
 
     // AQ_MSC_QUEUE picks the family the copy is submitted to: transfer asks for the async
@@ -606,6 +610,11 @@ CMSCTransfer::CMSCTransfer(WP<CDRMBackend> primary, SP<CBackend> logBackend, boo
     // mode the device cannot run refuses to start, the same way an unavailable copy family does.
     if (NEEDCS) {
         m_impl->scanFamily = mscPickScanFamily(families, count);
+        if (m_impl->scanFamily != UINT32_MAX) {
+            // Timestamps carry only these low bits; 0 means the family has none.
+            const uint32_t VALIDBITS = families[m_impl->scanFamily].timestampValidBits;
+            m_impl->timestampMask    = VALIDBITS >= 64 ? ~0ull : ((1ull << VALIDBITS) - 1);
+        }
         if (m_impl->scanFamily == UINT32_MAX) {
             log(AQ_LOG_ERROR, "drm: MSC: AQ_MSC_DAMAGE/BLINK needs a compute queue, and this device has none; refusing to start");
             return;
@@ -1024,6 +1033,10 @@ void CMSCTransfer::scanDestroy() {
         vkDestroySemaphore(DEV, m_impl->scanIncoming, nullptr);
         m_impl->scanIncoming = VK_NULL_HANDLE;
     }
+    if (m_impl->scanQPool) {
+        vkDestroyQueryPool(DEV, m_impl->scanQPool, nullptr);
+        m_impl->scanQPool = VK_NULL_HANDLE;
+    }
     if (m_impl->shadowView) {
         vkDestroyImageView(DEV, m_impl->shadowView, nullptr);
         m_impl->shadowView = VK_NULL_HANDLE;
@@ -1138,7 +1151,14 @@ bool CMSCTransfer::scanInit() {
         ok = BUILD(MSC_SCAN_GRID_SPIRV, sizeof(MSC_SCAN_GRID_SPIRV), m_impl->scanPipe8, "creating the grid scan pipeline") &&
             BUILD(MSC_SCAN_GRID_SPIRV_10, sizeof(MSC_SCAN_GRID_SPIRV_10), m_impl->scanPipe10, "creating the 10-bit grid scan pipeline");
     }
-    if (!ok) {
+    // The timestamp pair only feeds the counters, so counters off means no pool to pay for. A
+    // family without timestamp support keeps the wall timer alone.
+    if (ok && MSC_STATS_SECONDS > 0 && m_impl->timestampMask) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+        if (!checkResult(vkCreateQueryPool(DEV, &qi, nullptr, &m_impl->scanQPool), "creating the scan timestamp pool"))
+            m_impl->scanQPool = VK_NULL_HANDLE;
+    }
+    if (!ok || m_bad) {
         scanDestroy();
         return false;
     }
@@ -1694,6 +1714,9 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
         !checkResult(vkBeginCommandBuffer(m_impl->scanCmd, &bi), "beginning the grid scan command buffer"))
         return false;
 
+    if (m_impl->scanQPool)
+        vkCmdResetQueryPool(m_impl->scanCmd, m_impl->scanQPool, 0, 2);
+
     VkImageMemoryBarrier acquires[2] = {
         {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
          .srcAccessMask       = 0,
@@ -1717,6 +1740,10 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
     vkCmdPipelineBarrier(m_impl->scanCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                          2, acquires);
 
+    // Timestamp 0 sits at the head of the command buffer, after the queue's producer wait.
+    if (m_impl->scanQPool)
+        vkCmdWriteTimestamp(m_impl->scanCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_impl->scanQPool, 0);
+
     vkCmdBindPipeline(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, TENBIT ? m_impl->scanPipe10 : m_impl->scanPipe8);
     vkCmdBindDescriptorSets(m_impl->scanCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_impl->scanLayout, 0, 1, &m_impl->scanDS, 0, nullptr);
     const uint32_t push[6] = {CELL, COLS, ROWS, m_impl->shadowFresh ? 1u : 0u, width, height};
@@ -1726,6 +1753,8 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
         return false;
     }
     vkCmdDispatch(m_impl->scanCmd, total, 1, 1);
+    if (m_impl->scanQPool)
+        vkCmdWriteTimestamp(m_impl->scanCmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_impl->scanQPool, 1);
 
     VkImageMemoryBarrier  release  = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                       .srcAccessMask       = VK_ACCESS_SHADER_READ_BIT,
@@ -1780,6 +1809,13 @@ bool CMSCTransfer::scanRun(const Hyprutils::Math::CRegion* hint, uint32_t width,
     }
 
     m_impl->scanNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - BEGAN).count();
+    if (m_impl->scanQPool) {
+        // The fence above guarantees the results; the delta is masked because only the low valid
+        // bits of a timestamp are significant.
+        uint64_t stamps[2] = {};
+        if (vkGetQueryPoolResults(DEV, m_impl->scanQPool, 0, 2, sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            m_impl->scanGpuNs += (uint64_t)((double)((stamps[1] - stamps[0]) & m_impl->timestampMask) * m_impl->timestampPeriod);
+    }
     m_impl->scanFrames++;
     m_impl->scanCells += total;
     m_impl->shadowFresh = false;
@@ -2317,9 +2353,11 @@ void CMSCTransfer::logStats() {
     const double OWED  = m_impl->damageTrackedFramePixels ? (double)m_impl->damageOwedPixels / (double)m_impl->damageTrackedFramePixels * 100.0 : 0.0;
     const double MOVED = m_impl->damageTrackedFramePixels ? (double)m_impl->damageTrackedMovedPixels / (double)m_impl->damageTrackedFramePixels * 100.0 : 0.0;
     if (m_impl->scanFrames)
+        // The scan figure is 0.0 when the family has no timestamps; the wall figure still holds.
         log(AQ_LOG_DEBUG,
-            std::format("drm: MSC damage grid (t+{}s): {} frames, {} cells scanned, {} dirty, {:.1f}% of the scanned cells, {:.1f} us per frame", AGE, m_impl->scanFrames,
-                        m_impl->scanCells, m_impl->scanDirtyCells, m_impl->scanCells ? 100.0 * (double)m_impl->scanDirtyCells / (double)m_impl->scanCells : 0.0,
+            std::format("drm: MSC damage grid (t+{}s): {} frames, {} cells scanned, {} dirty, {:.1f}% of the scanned cells, {:.1f} us scan of {:.1f} us per frame", AGE,
+                        m_impl->scanFrames, m_impl->scanCells, m_impl->scanDirtyCells, m_impl->scanCells ? 100.0 * (double)m_impl->scanDirtyCells / (double)m_impl->scanCells : 0.0,
+                        m_impl->scanFrames ? (double)m_impl->scanGpuNs / (double)m_impl->scanFrames / 1000.0 : 0.0,
                         m_impl->scanFrames ? (double)m_impl->scanNs / (double)m_impl->scanFrames / 1000.0 : 0.0));
     log(AQ_LOG_DEBUG,
         std::format("drm: MSC damage full reasons: no tracking {}, size mismatch {}, unseeded {}, no reported damage {}, over the region budget {}, over {:.0f}% of the frame {}; "
